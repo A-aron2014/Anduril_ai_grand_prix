@@ -20,13 +20,16 @@ using PyTorch or similar.
 import math
 import logging
 import numpy as np
+import random
+import torch
+from collections import deque
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
-from anduril_gp.core.state_estimator import VehicleState
-from anduril_gp.perception.perception import GateObservation, Obstacle
-from anduril_gp.guidance.guidance import GuidanceOutput
+from core_gp.core.state_estimator import VehicleState
+from core_gp.perception.perception import GateObservation, Obstacle
+from core_gp.guidance.guidance import GuidanceOutput
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +168,7 @@ class RewardFunction:
 
     def __init__(self):
         self._prev_dist_to_gate: Optional[float] = None
+        
 
     def compute(self, state: VehicleState,
                 next_gate_pos: Optional[np.ndarray],
@@ -185,7 +189,14 @@ class RewardFunction:
             self._prev_dist_to_gate = dist
 
         # Speed bonus
-        reward += state.speed * self.SPEED_BONUS_SCALE
+        if next_gate_pos is not None:
+            gate_vec = next_gate_pos - state.position_ned()
+            norm = np.linalg.norm(gate_vec)
+            
+            if norm > 1e-6:
+                gate_dir = gate_vec / norm
+                forward_progress = np.dot(state.velocity_ned(), gate_dir)
+                reward += forward_progress * self.SPEED_BONUS_SCALE
 
         # Obstacle
         if obstacle_hit:
@@ -259,13 +270,22 @@ class RLPolicyBase(ABC):
         action = self.get_action(obs)
         vel_ned = action.to_velocity_ned(state)
 
+        if training and hasattr(self, "_pending"):
+            prev_obs, prev_actions, pre_reward, prev_done = self._pending
+            self.store_transition(prev_obs, prev_actions, pre_reward, obs, prev_done)
+            
         if training:
             reward = self.reward_fn.compute(state, next_gate_pos, gate_passed, obstacle_hit)
-            # next_obs will be populated on the next call; store placeholder
             self._pending = (obs, action, reward, done)
+        if done: 
+            self.reward_fn.reset()
+            if hasattr(self, "_pending"):
+                del self._pending
+            
+
 
         target_pos = state.position_ned() + vel_ned * 0.5   # 0.5 s lookahead
-        target_yaw = math.atan2(vel_ned[1], max(abs(vel_ned[0]), 0.01)) if np.linalg.norm(vel_ned[:2]) > 0.1 else state.yaw
+        target_yaw = math.atan2(vel_ned[1],vel_ned[0]) if np.linalg.norm(vel_ned[:2]) > 0.1 else state.yaw
 
         self._step_count += 1
         return GuidanceOutput(
@@ -314,6 +334,27 @@ class SACPolicy(RLPolicyBase):
     Soft Actor-Critic stub. Requires PyTorch.
     Fill in Actor/Critic networks; the interface is already wired.
     """
+    def _sample_batch(self):
+        batch = random.sample(self._replay_buffer, self._batch_size)
+        obs, actions, rewards, next_obs, dones = zip(*batch)
+        return {
+            'obs' : torch.FloatTensor(np.array(obs)),
+            'actions': torch.FloatTensor(np.array(actions)),
+            'rewards': torch.FloatTensor(rewards).unsqueeze(1),
+            'next_obs': torch.FloatTensor(np.array(next_obs)),
+            'dones': torch.FloatTensor(dones).unsqueeze(1),
+        }
+
+    def _sample_action(self, obs):
+        mean = self.actor_mean(obs)
+        log_std = torch.clamp(self.actor_log_std(obs), -5, 2)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        z = normal.rsample()
+        action = torch.tanh(z)
+        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=1, keepdim=True)
+        return action, log_prob
 
     def __init__(self, obs_dim: int = 19, action_dim: int = 3,
                  hidden_dim: int = 256, lr: float = 3e-4):
@@ -321,10 +362,11 @@ class SACPolicy(RLPolicyBase):
         self._built = False
         self._hidden_dim = hidden_dim
         self._lr = lr
-        self._replay_buffer = []
+        self._replay_buffer = deque(maxlen=100_000)
         self._batch_size = 256
         self._gamma = 0.99
         self._tau = 0.005
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         try:
             self._build_networks()
@@ -355,6 +397,27 @@ class SACPolicy(RLPolicyBase):
         self.q2 = MLP(self.obs_dim + self.action_dim, 1, H)
         self.q1_target = MLP(self.obs_dim + self.action_dim, 1, H)
         self.q2_target = MLP(self.obs_dim + self.action_dim, 1, H)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+        # ---------------------------------------------------
+        # MOVE NETWORKS TO DEVICE
+        # ---------------------------------------------------
+
+        self.actor_mean.to(self.device)
+        self.actor_log_std.to(self.device)
+
+        self.q1.to(self.device)
+        self.q2.to(self.device)
+
+        self.q1_target.to(self.device)
+        self.q2_target.to(self.device)
+
+        # ---------------------------------------------------
+        # COPY INITIAL TARGET WEIGHTS
+        # ---------------------------------------------------
+
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
         self._built = True
 
         params = (list(self.actor_mean.parameters()) +
@@ -368,26 +431,138 @@ class SACPolicy(RLPolicyBase):
     def get_action(self, obs: RLObservation) -> RLAction:
         if not self._built:
             return RLAction(raw=np.zeros(self.action_dim, dtype=np.float32))
-        import torch
+        self.actor_mean.eval()
+        self.actor_log_std.eval()
+        
         with torch.no_grad():
-            x = torch.FloatTensor(obs.vector).unsqueeze(0)
+            x = torch.FloatTensor(obs.vector).unsqueeze(0).to(self.device)
             mean = self.actor_mean(x)
             log_std = torch.clamp(self.actor_log_std(x), -5, 2)
             std = log_std.exp()
             action = torch.tanh(mean + std * torch.randn_like(std))
-        return RLAction(raw=action.squeeze().numpy())
+        return RLAction(raw=action.squeeze().cpu().numpy())
 
     def store_transition(self, obs, action, reward, next_obs, done):
         self._replay_buffer.append((obs.vector, action.raw, reward, next_obs.vector, done))
-        if len(self._replay_buffer) > 100_000:
-            self._replay_buffer.pop(0)
+
 
     def update(self) -> dict:
-        if not self._built or len(self._replay_buffer) < self._batch_size:
+        if len(self._replay_buffer) < self._batch_size:
             return {}
-        # Full SAC update logic goes here (Q-loss + actor loss + entropy tuning)
-        # Left as implementation exercise; standard SAC paper applies directly.
-        return {'status': 'update_not_implemented'}
+        self.actor_mean.train()
+        self.actor_log_std.train()
+        self.q1.train()
+        self.q2.train()
+    
+        import torch.nn.functional as F
+
+        batch = self._sample_batch()
+
+        obs = batch['obs'].to(self.device)
+        actions = batch['actions'].to(self.device)
+        rewards = batch['rewards'].to(self.device)
+        next_obs = batch['next_obs'].to(self.device)
+        dones = batch['dones'].to(self.device)
+
+        alpha = 0.2
+
+        # --------------------------------------------------
+        # TARGET Q
+        # --------------------------------------------------
+
+        with torch.no_grad():
+
+            next_actions, next_log_probs = self._sample_action(next_obs)
+
+            next_input = torch.cat(
+                [next_obs, next_actions],
+                dim=1
+            )
+
+            q1_next = self.q1_target(next_input)
+            q2_next = self.q2_target(next_input)
+
+            q_next = torch.min(q1_next, q2_next)
+
+            target_q = rewards + (
+                1 - dones
+            ) * self._gamma * (
+                q_next - alpha * next_log_probs
+            )
+
+        # --------------------------------------------------
+        # Q LOSS
+        # --------------------------------------------------
+
+        q_input = torch.cat([obs, actions], dim=1)
+
+        q1 = self.q1(q_input)
+        q2 = self.q2(q_input)
+
+        q1_loss = F.mse_loss(q1, target_q)
+        q2_loss = F.mse_loss(q2, target_q)
+
+        q_loss = q1_loss + q2_loss
+
+        self.q_opt.zero_grad()
+        q_loss.backward()
+        self.q_opt.step()
+
+        # --------------------------------------------------
+        # ACTOR LOSS
+        # --------------------------------------------------
+
+        new_actions, log_probs = self._sample_action(obs)
+
+        actor_input = torch.cat(
+            [obs, new_actions],
+            dim=1
+        )
+
+        q1_actor = self.q1(actor_input)
+        q2_actor = self.q2(actor_input)
+
+        q_actor = torch.min(q1_actor, q2_actor)
+
+        actor_loss = (
+            alpha * log_probs - q_actor
+        ).mean()
+
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        self.actor_opt.step()
+
+        # --------------------------------------------------
+        # SOFT TARGET UPDATE
+        # --------------------------------------------------
+        for p in self.q1_target.parameters():
+            p.requires_grad_(False)
+        
+        for target_param, param in zip(
+            self.q1_target.parameters(),
+            self.q1.parameters()
+        ):
+            target_param.data.copy_(
+                self._tau * param.data +
+                (1 - self._tau) * target_param.data
+            )
+        for p in self.q2_target.parameters():
+            p.requires_grad_(False)
+        
+        for target_param, param in zip(
+            self.q2_target.parameters(),
+            self.q2.parameters()
+        ):
+            target_param.data.copy_(
+                self._tau * param.data +
+                (1 - self._tau) * target_param.data
+            )
+
+        return {
+            'q_loss': float(q_loss.item()),
+            'actor_loss': float(actor_loss.item()),
+            'buffer_size': len(self._replay_buffer),
+        }
 
     def save(self, path: str):
         if not self._built:
