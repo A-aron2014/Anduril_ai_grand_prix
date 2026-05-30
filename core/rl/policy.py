@@ -24,9 +24,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
-from anduril_gp.core.state_estimator import VehicleState
-from anduril_gp.perception.perception import GateObservation, Obstacle
-from anduril_gp.guidance.guidance import GuidanceOutput
+from core.core.state_estimator import VehicleState
+from core.perception.perception import GateObservation, Obstacle
+from core.guidance.guidance import GuidanceOutput
 
 logger = logging.getLogger(__name__)
 
