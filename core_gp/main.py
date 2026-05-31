@@ -24,13 +24,13 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 import numpy as np
 
-from core_gp.comms.mavlink_bridge import MAVLinkBridge, TelemetryState, ControlCommand
-from core_gp.comms.vision_stream   import VisionStreamReceiver
-from core_gp.core.state_estimator  import StateEstimator, VehicleState
-from core_gp.perception.perception import PerceptionManager
-from core_gp.guidance.guidance     import GuidanceAlgorithm, CourseMap, GuidanceOutput
-from core_gp.control.autopilot     import Autopilot, AutopilotConfig
-from core_gp.rl.policy             import RLPolicyBase, RandomPolicy
+from comms.mavlink_bridge  import MAVLinkBridge, TelemetryState, ControlCommand
+from comms.vision_stream   import VisionStreamReceiver
+from state_estimator  import StateEstimator, VehicleState
+from perception.perception import PerceptionManager
+from guidance.guidance     import GuidanceAlgorithm, CourseMap, GuidanceOutput
+from control.autopilot     import Autopilot, AutopilotConfig
+from rl.policy             import RLPolicyBase, RandomPolicy
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO,
@@ -268,7 +268,6 @@ def main():
     )
     stack = AutonomyStack(config=config)
     stack.run()
-
 
 if __name__ == '__main__':
     main()

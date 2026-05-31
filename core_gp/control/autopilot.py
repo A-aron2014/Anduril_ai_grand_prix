@@ -16,9 +16,9 @@ from typing import Optional
 
 import numpy as np
 
-from anduril_gp.core.state_estimator import VehicleState
-from anduril_gp.guidance.guidance import GuidanceOutput
-from anduril_gp.comms.mavlink_bridge import ControlCommand
+from state_estimator import VehicleState
+from guidance.guidance import GuidanceOutput
+from comms.mavlink_bridge import ControlCommand
 
 logger = logging.getLogger(__name__)
 
