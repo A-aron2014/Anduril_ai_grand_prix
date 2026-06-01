@@ -166,18 +166,19 @@ class VisionStreamReceiver:
 
             if len(data) < HEADER_SIZE:
                 continue
-
+            # retrieve the frame id, chunk, total number of chunks and payload size from the UDP transmission
             frame_id, chunk_id, total_chunks, jpeg_size, payload_size, sim_time_ns = \
                 struct.unpack_from(HEADER_FORMAT, data, 0)
-
+            #Organize payload size
             payload = data[HEADER_SIZE:HEADER_SIZE + payload_size]
 
             # -------------------------
             # CRITICAL: only keep newest frame
             # -------------------------
+            #Drop frame if not newest
             if frame_id < self._active_frame_id:
                 continue
-
+            #Buffer if not the current frame    
             if frame_id > self._active_frame_id:
                 self._active_frame_id = frame_id
                 self._active_buffer = FrameBuffer(frame_id, total_chunks, sim_time_ns)
@@ -185,15 +186,15 @@ class VisionStreamReceiver:
             buf = self._active_buffer
             if buf is None:
                 continue
-
+            #Add acquired chunk into the buffer
             buf.add_chunk(chunk_id, payload)
-
+            #Check for image completeness
             if buf.is_complete():
                 jpeg_bytes = buf.assemble()
 
                 # reset buffer immediately (drop backlog)
                 self._active_buffer = None
-
+                #Decode the combined chunks into an image
                 # push to decode (overwrite old if needed)
                 self._push_decode(jpeg_bytes, sim_time_ns)
 
@@ -222,6 +223,7 @@ class VisionStreamReceiver:
                 continue
 
             arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+            #read data from cache and decode into image data
             frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
             if frame is None:

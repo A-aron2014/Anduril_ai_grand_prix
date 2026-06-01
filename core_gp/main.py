@@ -26,7 +26,7 @@ import numpy as np
 
 from comms.mavlink_bridge  import MAVLinkBridge, TelemetryState, ControlCommand
 from comms.vision_stream   import VisionStreamReceiver
-from state_estimator  import StateEstimator, VehicleState
+from core.state_estimator  import StateEstimator, VehicleState
 from perception.perception import PerceptionManager
 from guidance.guidance     import GuidanceAlgorithm, CourseMap, GuidanceOutput
 from control.autopilot     import Autopilot, AutopilotConfig
@@ -99,7 +99,7 @@ class AutonomyStack:
         self.rl_policy: RLPolicyBase = RandomPolicy()
         if self.cfg.policy_weights:
             try:
-                from anduril_gp.rl.policy import SACPolicy
+                from rl.policy import SACPolicy
                 self.rl_policy = SACPolicy()
                 self.rl_policy.load(self.cfg.policy_weights)
                 logger.info("Loaded SAC policy weights.")

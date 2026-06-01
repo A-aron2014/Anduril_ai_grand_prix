@@ -92,6 +92,8 @@ class StateEstimator:
 
     # Complementary filter weight for VO position blending
     VO_ALPHA = 0.05   # weight given to VO correction (0 = ignore, 1 = fully trust VO)
+    IMU_ALPHA= 0.05   # weight given to the IMU integration of Gyro and Accel. (0 = ignore, 1 = fully trust)
+    LPF_ALPHA= 0.05
 
     def __init__(self):
         self._state = VehicleState()
@@ -103,9 +105,32 @@ class StateEstimator:
     # Public API
     # ------------------------------------------------------------------
 
+
     def get_state(self) -> VehicleState:
         with self._lock:
             return VehicleState(**self._state.__dict__)
+        
+    def predict_state(self, imu: TelemetryState, dt):
+            s = self._state
+
+            # Attitude — direct from simulator (authoritative)
+            s.roll       = imu.roll
+            s.pitch      = imu.pitch
+            s.yaw        = imu.yaw
+            s.p          = imu.rollspeed
+            s.q          = imu.pitchspeed
+            s.r          = imu.yawspeed
+
+
+            s.north = imu.north
+            s.east  = imu.east
+            s.down  = imu.down
+            s.vn    = imu.vn
+            s.ve    = imu.ve
+            s.vd    = imu.vd
+            s.position_source = 'mavlink'
+            self._have_mavlink_position = True
+
 
     def update_from_mavlink(self, telem: TelemetryState):
         """Called by MAVLink bridge callback (~120 Hz)."""
@@ -188,3 +213,73 @@ class StateEstimator:
         dn = target_ned[0] - s.north
         de = target_ned[1] - s.east
         return math.atan2(de, dn)
+    
+
+    # def RotationMatrix321(euler_angles):
+    #     """Given the Euler Angles calculate and return the Rotation matrix in 3-2-1 Format"""
+    #     #Extract angles from the input vector
+    #     phi = float(euler_angles[0])
+    #     theta = float(euler_angles[1])
+    #     psi = float(euler_angles[2])
+
+    #     #Define Rotation Matrix 1
+    #     R3 = np.array([[np.cos(psi), np.sin(psi), 0],
+    #                 [-np.sin(psi), np.cos(psi),0],
+    #                 [0,          0,      1]])
+    #     #Define Rotation Matrix 2 from Yaw rotation to Pitch Rotation
+    #     R2 = np.array([[np.cos(theta), 0,  -np.sin(theta)],
+    #                 [0,          1,          0],
+    #                 [np.sin(theta), 0,   np.cos(theta)]])
+    #     #Define Rotation Matrix 3 from Pitch Rotation to Roll Rotation
+    #     R1 = np.array([[1,      0,          0],
+    #                 [0,  np.cos(phi), np.sin(phi)],
+    #                 [0, -np.sin(phi), np.cos(phi)]])
+    #     full_rotation = R1 @ R2 @ R3
+    #     return full_rotation
+
+    # def TransformFromInertialToBody(vector_inertial, euler_angles):
+    #     """For a vector given in inertial coordinates, determine the components in body coordinates."""
+    #     inertial_to_body_rotation = RotationMatrix321(euler_angles)
+
+    #     vector_body = inertial_to_body_rotation @ vector_inertial
+
+    #     return vector_body
+
+    # def TransformFromBodyToInertial(vector_body, euler_angles):
+    #     """For a vector given in body coordinates, determine the components in inertial coordinates."""
+    #     body_to_inertial_rotation = RotationMatrix321(euler_angles)
+    #     #Multiply the rotation matrix transpose with the vector relative to the Body Frame
+    #     vector_inertial = body_to_inertial_rotation.T @ vector_body
+
+    #     return vector_inertial
+    
+    def Complimentary_filter (self,dt, imu: TelemetryState, prev_imu: TelemetryState, alpha):
+    
+        
+        # We prefer the gyroscope data over the accelerometer
+        # data by selecting a high value for ALPHA
+        ALPHA = alpha
+    
+        
+        # previous yaw, pitch, and roll values
+        roll, pitch, yaw = self._state.roll,self._state.pitch,self._state.yaw   #euler_angles[i-1]
+        
+        #Integrate the gyroscope data using Euler's method
+        roll += (imu.rollspeed+prev_imu.rollspeed)/2 * dt
+        pitch += (imu.pitchspeed+prev_imu.pitchspeed)/2 * dt
+        yaw += (imu.yawspeed+prev_imu.yawspeed)/2 * dt
+        
+        # Accelerometer data processing
+        acc_roll = np.arctan2(imu.ay, np.sqrt(imu.ay** 2 + imu.az ** 2))  
+        acc_pitch = np.arctan2(np.sqrt(imu.ax ** 2 + imu.ay ** 2), imu.az)  
+
+        roll = ALPHA * roll + (1 - ALPHA) * acc_roll
+        pitch = ALPHA * pitch + (1 - ALPHA) * acc_pitch
+        
+        euler_angles = [roll, pitch, yaw]
+        
+        return euler_angles
+    def _low_pass_filter(z_old, u_new, lpf_alpha):
+        if z_old is None:
+            return u_new
+        return lpf_alpha * z_old + (1-lpf_alpha) * u_new
