@@ -15,7 +15,7 @@ Usage
     # or
     await stack.run_async()
 """
-
+import math
 import asyncio
 import logging
 import time
@@ -99,7 +99,7 @@ class AutonomyStack:
         self.rl_policy: RLPolicyBase = RandomPolicy()
         if self.cfg.policy_weights:
             try:
-                from rl.policy import SACPolicy
+                from core_gp.rl.policy import SACPolicy
                 self.rl_policy = SACPolicy()
                 self.rl_policy.load(self.cfg.policy_weights)
                 logger.info("Loaded SAC policy weights.")
@@ -108,6 +108,62 @@ class AutonomyStack:
 
         self._running = False
         self._latest_guidance: Optional[GuidanceOutput] = None
+
+    @dataclass
+    class VehicleState:
+        """
+        Unified vehicle state in NED frame (origin = arm point).
+        All angles in radians, distances in metres, velocities in m/s.
+        """
+        # --- Position (NED) ---
+        north: float = 0.0
+        east: float = 0.0
+        down: float = 0.0
+
+        # --- Velocity (NED) ---
+        vn: float = 0.0
+        ve: float = 0.0
+        vd: float = 0.0
+
+        # --- Attitude (ZYX Euler, radians) ---
+        roll: float = 0.0
+        pitch: float = 0.0
+        yaw: float = 0.0
+
+        # --- Angular rates (rad/s, body frame) ---
+        p: float = 0.0  # roll rate
+        q: float = 0.0  # pitch rate
+        r: float = 0.0  # yaw rate
+
+        # --- Derived ---
+        speed: float = 0.0           # |v| m/s
+        altitude_agl: float = 0.0   # above arm point (positive up) = -down
+
+        # --- Meta ---
+        timestamp: float = field(default_factory=time.time)
+        position_source: str = 'mavlink'   # 'mavlink' | 'dead_reckoning' | 'vo_aided'
+
+        def position_ned(self) -> np.ndarray:
+            return np.array([self.north, self.east, self.down])
+
+        def velocity_ned(self) -> np.ndarray:
+            return np.array([self.vn, self.ve, self.vd])
+
+        def euler_angles(self) -> np.ndarray:
+            return np.array([self.roll, self.pitch, self.yaw])
+
+        def body_to_ned_R(self) -> np.ndarray:
+            """3×3 rotation matrix: body → NED."""
+            cr, sr = math.cos(self.roll),  math.sin(self.roll)
+            cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+            cy, sy = math.cos(self.yaw),   math.sin(self.yaw)
+            return np.array([
+                [cp*cy,  sr*sp*cy - cr*sy,  cr*sp*cy + sr*sy],
+                [cp*sy,  sr*sp*sy + cr*cy,  cr*sp*sy - sr*cy],
+                [-sp,    sr*cp,              cr*cp           ],
+            ])
+        
+
 
     # ------------------------------------------------------------------
     # Callbacks (called from background threads)
@@ -242,12 +298,48 @@ class AutonomyStack:
         self.vision.stop()
         self.mavlink.close()
 
+def parse_mavlink_data(state: VehicleState, data : TelemetryState):
+    state.north = data.north
+    state.east = data.east
+    state.down = data.down
+    state.roll = data.roll
+    state.pitch = data.pitch
+    state.yaw = data.yaw
+    state.p = data.rollspeed
+    state.p = data.pitchspeed
+    state.r = data.yawspeed
 
+    state.vn = data.vn
+    state.ve = data.ve
+    state.vd = data.vd
+
+    return state
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
-
 def main():
+    import time
+
+    from SampleCode.setup import setup_components
+
+    # Modify these properties if you want to run the server remotely for example
+    SIM_SERVER_UDP_IP = "127.0.0.1"
+    SIM_SERVER_UDP_PORT = 14550
+
+    # time since sim started ms
+    system_boot_ms = int(time.time() * 1000)
+
+    # arbitrary shared data between the various components
+    shared_data = {}
+
+    # setup components
+    components = setup_components(shared_data, system_boot_ms, SIM_SERVER_UDP_IP, SIM_SERVER_UDP_PORT)
+    controller = components['controller']
+    ts_loop = components['ts_loop']
+    mavlink_rx = components['mavlink_rx']
+    vision_rx = components['vision_rx']
+
+    mavBridge = MAVLinkBridge()
     config = StackConfig(
         mavlink_host='127.0.0.1',
         mavlink_port=14550,
@@ -267,7 +359,30 @@ def main():
         gate_speed_mps=8.0,
     )
     stack = AutonomyStack(config=config)
-    stack.run()
+
+    print("Arming drone...", flush=True)
+    #controller.arm()
+    mavBridge.arm()
+    print("Starting control loop...", flush=True)
+    is_running = True
+    mav_state = VehicleState()
+    while is_running:
+        #mav_state = mavBridge.get_state()
+        mav_state = parse_mavlink_data(mav_state, mavBridge.get_state()) #query mav state and parse into the vehicle state object
+        print(mav_state)
+        time.sleep(0.1)
+        #controller.update()
+        #stack.run()
+
+        
+        #FOR NOW TRY TO GIVE GATE LOCATIONS TO THE RL MODULE AS WELL AS VEHICLE STATES 
+    # exit
+    ts_loop.get_thread_for_join().join(timeout=1.0)
+    mavlink_rx.get_thread_for_join().join(timeout=1.0)
+    vision_rx.get_thread_for_join().join(timeout=1.0)
+
+    print("Client exited!", flush=True)
+
 
 if __name__ == '__main__':
     main()
