@@ -23,7 +23,7 @@ class MAVLinkRX:
         rx = cls(mavlink_connection, data)
         rx.thread = threading.Thread(
             target=rx.mavlink_receive_loop,
-            daemon = False
+            daemon=False
         )
         rx.is_running = True
         rx.thread.start()
@@ -110,8 +110,10 @@ class MAVLinkRX:
 
             # --------------------------------------------------------------------------------------
             # DATA_TRANSMISSION_HANDSHAKE - Repurposed and used for upcoming 'Track Data' packets
+            # FIX #6: Use msg_type instead of re-calling msg.get_type() — consistent with all
+            # other branches above.
             # --------------------------------------------------------------------------------------
-            elif msg.get_type() == "DATA_TRANSMISSION_HANDSHAKE":
+            elif msg_type == "DATA_TRANSMISSION_HANDSHAKE":
                 track_data_transfer_id = msg.width
                 self.track_chunks[track_data_transfer_id] = {}
                 self.expected_num_track_chunks[track_data_transfer_id] = msg.packets
@@ -124,22 +126,21 @@ class MAVLinkRX:
         response_time = msg.tc1
 
     def on_attitude(self, msg):
-        roll = msg.roll
-        pitch = msg.pitch
-        yaw = msg.yaw
-        roll_speed = msg.rollspeed
-        pitch_speed = msg.pitchspeed
-        yaw_speed = msg.yawspeed
-        time_boot_ms = msg.time_boot_ms
+        self.data['roll']        = msg.roll
+        self.data['pitch']       = msg.pitch
+        self.data['yaw']         = msg.yaw
+        self.data['roll_speed']  = msg.rollspeed
+        self.data['pitch_speed'] = msg.pitchspeed
+        self.data['yaw_speed']   = msg.yawspeed
 
     def on_local_position_ned(self, msg):
-        pos_x = msg.x
-        pos_y = msg.y
-        pos_z = msg.z
-        vel_x = msg.vx
-        vel_y = msg.vy
-        vel_z = msg.vz
-        time_boot_ms = msg.time_boot_ms
+        # pos_x/y/z = north/east/down; vel_x/y/z = vn/ve/vd
+        self.data['pos_x'] = msg.x
+        self.data['pos_y'] = msg.y
+        self.data['pos_z'] = msg.z
+        self.data['vel_x'] = msg.vx
+        self.data['vel_y'] = msg.vy
+        self.data['vel_z'] = msg.vz
 
     def on_odometry(self, msg):
         pos_x, pos_y, pos_z = msg.x, msg.y, msg.z
