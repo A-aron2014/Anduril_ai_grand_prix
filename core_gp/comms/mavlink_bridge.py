@@ -31,6 +31,7 @@ import math
 import struct
 import threading
 import time
+import numpy as np
 
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -263,15 +264,15 @@ class MAVLinkBridge:
     # ========================================================
 
     def arm(self):
-
-        self._connection.mav.command_long_send(
-            self.target_system,
-            self.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0,
-            1,
-            0, 0, 0, 0, 0, 0
-        )
+        self.arm()
+        # self._connection.mav.command_long_send(
+        #     self.target_system,
+        #     self.target_component,
+        #     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        #     0,
+        #     1,
+        #     0, 0, 0, 0, 0, 0
+        # )
 
     def send_command(
         self,

@@ -67,9 +67,15 @@ def main():
         print("Interrupted — holding position.")
         fc.hold_position()
     finally:
-        ts_loop.get_thread_for_join().join(timeout=1.0)
-        mavlink_rx.get_thread_for_join().join(timeout=1.0)
-        vision_rx.get_thread_for_join().join(timeout=1.0)
+        tl = ts_loop.get_thread_for_join()
+        if tl: tl.join(timeout=1.0)
+        
+        ml = mavlink_rx.get_thread_for_join()
+        if ml: ml.join(timeout=1.0)
+        
+        vl = vision_rx.get_thread_for_join()
+        if vl: vl.join(timeout=1.0)
+        
         print("Exited cleanly.")
 
 if __name__ == '__main__':

@@ -124,8 +124,11 @@ class FlightController:
     FORWARD_SPEED   = 4.0    # m/s north during forward flight
     ALT_THRESHOLD_M = 0.4    # metres — "close enough" to target alt
 
-    def __init__(self, bridge: MAVLinkBridge):
-        self.bridge = bridge
+    def __init__(self, sim_conn):
+        self.bridge = MAVLinkBridge()
+        self.conn = sim_conn
+        self.target_system    = sim_conn.target_system
+        self.target_component = sim_conn.target_component
 
     # ------------------------------------------------------------------
     # High-level sequence
@@ -133,7 +136,7 @@ class FlightController:
 
     def connect(self):
         """Connect and block until heartbeat."""
-        self.bridge.connect()
+        self.conn.connect()
         logger.info("Waiting for connection...")
         for _ in range(40):
             if self.bridge.is_connected():
@@ -143,10 +146,15 @@ class FlightController:
         raise RuntimeError("No heartbeat after 10 s — is the sim running?")
 
     def arm(self):
-        """Send arm command and wait for the drone to report armed."""
-        logger.info("Arming...")
         self.bridge.arm()
-        # Give the sim a moment to process the arm command
+        # self.conn.mav.command_long_send(
+        #     self.target_system,
+        #     self.target_component,
+        #     mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        #     0,    # confirmation
+        #     1,    # param1: 1 = arm
+        #     0, 0, 0, 0, 0, 0
+        # )
         time.sleep(1.0)
         logger.info("Arm command sent.")
 
@@ -163,8 +171,8 @@ class FlightController:
 
         cmd = ControlCommand(
             # Stay at current N/E, climb to target altitude
-            target_north = self.bridge.get_state().north,
-            target_east  = self.bridge.get_state().east,
+            target_north = self.conn.get_state().north,
+            target_east  = self.conn.get_state().east,
             target_down  = target_down,
 
             # Climb at specified speed, no lateral movement
