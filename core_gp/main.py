@@ -52,9 +52,11 @@ def main():
             daemon=True
         ).start()
 
+        fc.send_sim_reset()
+        time.sleep(6.0)          # sim needs ~5s after reset before race can start
         fc.arm()
-        target_down = fc.takeoff(alt_m=5.0)
-        fc.fly_forward(speed_mps=4.0, duration_s=5.0, target_down=target_down)
+        fc.takeoff(alt_m=1.0)   # stay low — gate 0 center is at altitude ~0m
+        fc.fly_gates(gate_store)
 
     except KeyboardInterrupt:
         print("Interrupted — holding position.")
