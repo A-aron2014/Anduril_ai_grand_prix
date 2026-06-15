@@ -18,8 +18,8 @@ from typing import Optional
 
 import numpy as np
 
-from core_gp.comms.mavlink_bridge import TelemetryState
-from core_gp.perception.perception import VisualOdometryResult
+from comms.mavlink_bridge import TelemetryState
+from perception.perception import VisualOdometryResult
 
 logger = logging.getLogger(__name__)
 

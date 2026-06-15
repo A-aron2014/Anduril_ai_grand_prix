@@ -1,4 +1,11 @@
-pymavlink>=2.4.40
-numpy>=1.24.0
-opencv-python>=4.8.0
-torch>=2.0.0          # for SACPolicy / PPO — optional but recommended
+# Comms
+pymavlink
+
+# Vision
+#cv2
+opencv-python
+numpy
+
+# Debug
+matplotlib
+keyboard
