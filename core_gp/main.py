@@ -1,3 +1,6 @@
+from time import time
+
+
 def main():
     import time
     import threading
@@ -20,7 +23,7 @@ def main():
 
     # Wire gate data into the existing RX instance via monkey-patch
     gate_store = GateStore()
-
+    
     def _on_track_data(payload: bytes):
         import struct
         num_gates, = struct.unpack_from("<H", payload)
@@ -34,7 +37,7 @@ def main():
             payload = payload[38:]
             gates.append({
                 "gate_id": gate_id,
-                "north": pos_n, "east": pos_e, "down": pos_d,
+                "north": pos_n, "east": pos_e, "down": -pos_d + 1.5,
                 "orient": (ow, ox, oy, oz),
                 "width": width, "height": height,
             })

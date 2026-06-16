@@ -112,10 +112,10 @@ class FlightController:
     No second UDP socket is opened.
     """
 
-    TAKEOFF_ALT_M   = 5.0   # metres above arm point (positive up)
-    TAKEOFF_SPEED   = 2.0   # m/s upward during climb
-    FORWARD_SPEED   = 4.0   # m/s north during forward flight
-    ALT_THRESHOLD_M = 0.4   # metres — "close enough" to target alt
+    TAKEOFF_ALT_M   = 0.1   # metres above arm point (positive up)
+    TAKEOFF_SPEED   = 0.1   # m/s upward during climb
+    FORWARD_SPEED   = 0.1   # m/s north during forward flight
+    ALT_THRESHOLD_M = 0.01   # metres — "close enough" to target alt
 
     def __init__(self, sim_conn, shared_data: dict, system_boot_ms: int = None):
         self.conn = sim_conn
@@ -144,9 +144,13 @@ class FlightController:
             self.data.get('vel_z', 0.0),
         )
 
-    def _yaw(self):
+    def _yaw(self) -> float:
         """Return yaw (rad) from the latest ATTITUDE message."""
         return self.data.get('yaw', 0.0)
+
+    def _pitch(self) -> float:
+        """Return pitch (rad) from the latest ATTITUDE message."""
+        return self.data.get('pitch', 0.0)
 
     def _wait_for_telemetry(self, timeout_s: float = 5.0):
         """Block until shared_data contains at least one position update."""
@@ -241,7 +245,7 @@ class FlightController:
 
         # Attitude rate mode: zero body rates (hold level), thrust above hover to climb.
         # 0.6 ≈ hover per reference; 0.75 should produce a steady climb.
-        CLIMB_THRUST = 0.75
+        CLIMB_THRUST = 0.7
 
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
@@ -251,10 +255,28 @@ class FlightController:
             logger.info(f"  Alt: {current_alt:.2f} m  (target {alt_m:.1f} m)")
             if current_alt >= alt_m - self.ALT_THRESHOLD_M:
                 logger.info("Takeoff complete.")
-                return target_down
+                break
             time.sleep(0.05)
+        else:
+            logger.warning("Takeoff timed out — proceeding anyway.")
+            return target_down
 
-        logger.warning("Takeoff timed out — proceeding anyway.")
+        # Settle: hold altitude until vertical velocity is calm before starting gate flight.
+        # Without this, the drone enters fly_gates with 7+ m/s upward velocity and
+        # oscillates wildly around the first gate's altitude target.
+        logger.info("Settling — waiting for vertical velocity < 0.3 m/s...")
+        settle_end = time.monotonic() + 4.0
+        while time.monotonic() < settle_end:
+            _, _, vd = self._vel()
+            _, _, d  = self._pos()
+            alt_err  = (-d) - alt_m
+            vert_vel = -vd
+            thrust   = max(0.05, min(0.85, 0.13 - alt_err * 0.15 - vert_vel * 0.25))
+            self._send_attitude_target(0.0, 0.0, 0.0, thrust)
+            if abs(vd) < 0.3:
+                logger.info("Vertical velocity settled.")
+                break
+            time.sleep(0.05)
         return target_down
 
     def fly_forward(self, duration_s: float = 5.0, target_down: float = None):
@@ -266,7 +288,7 @@ class FlightController:
         # Attitude rate mode: negative pitch_rate = nose down = forward motion.
         # Thrust is adjusted by a P-controller to hold the takeoff altitude.
         # 0.6 ≈ hover thrust per reference controller; KP tuned conservatively.
-        HOVER_THRUST = 0.6
+        HOVER_THRUST = 0.4
         FORWARD_PITCH = -0.1   # rad/s, gentle forward tilt (~6 deg/s)
         THRUST_KP    = 0.08    # thrust per metre of altitude error
 
@@ -307,22 +329,31 @@ class FlightController:
             logger.warning("fly_gates: No gate data available — aborting.")
             return
 
-        # Hover thrust for this sim is ~0.25; 0.45 gives controlled descent headroom.
-        HOVER_THRUST  = 0.45
-        THRUST_KP     = 0.15   # thrust per metre of altitude error
-        MAX_THRUST    = 0.85
-        MIN_THRUST    = 0.1    # low enough to descend, high enough to keep control
-        YAW_KP        = 2.0    # rad/s per radian of yaw error
-        MAX_YAW_RATE  = 0.8
-        FORWARD_PITCH = -0.1   # rad/s (negative = nose down = forward)
-        GATE_RADIUS_M = 5.0    # horizontal radius to count gate as passed
-        ALT_LEASH_M   = 5.0    # suspend forward pitch when this far above target
+        # Empirically: T≈0.10-0.13 maintains altitude at level flight. 0.13 is the setpoint.
+        # MIN below 0.13 → drone descends; MAX 0.85 → fast climb for large altitude gaps.
+        HOVER_THRUST       = 0.13
+        THRUST_KP          = 0.15   # thrust per metre of altitude error (P)
+        THRUST_KD          = 0.25   # thrust per m/s of vertical velocity (D — prevents overshoot)
+        MAX_THRUST         = 0.85
+        MIN_THRUST         = 0.05   # below hover so drone can actually descend when too high
+        YAW_KP             = 2.0    # rad/s per radian of yaw error
+        MAX_YAW_RATE       = 0.8
+        GATE_RADIUS_M      = 1.5    # horizontal radius to count gate as passed
+        GATE_HALF_HEIGHT   = .75   # half of 2.72m gate — altitude must be within this
+        ALT_LEASH_M        = 5.0    # forward pitch suspended when this far from target alt
+        MAX_SPEED_MPS      = 20.0   # hard speed cap — high enough to stay in fwd mode through gates
+        DECEL_SPEED        = 2.0    # below this, stop active backward pitch (prevent reverse)
+        FORWARD_PITCH      = -0.1   # rad/s: nose-down → forward
+        # LEVEL_PITCH is applied only when altitude gap is large (between gates 2-5).
+        # NOT applied for overspeed or misaligned — that caused gate-0 oscillation.
+        LEVEL_PITCH        = +0.1   # rad/s: nose-up → active deceleration + allows climb
 
         for gate in sorted(gates, key=lambda g: g['gate_id']):
-            gid       = gate['gate_id']
-            g_n       = gate['north']
-            g_e       = gate['east']
-            target_alt = max(gate['down'], 0.3)  # altitude to target; min 0.3m
+            gid      = gate['gate_id']
+            g_n      = gate['north']
+            g_e      = gate['east']
+            gate_alt   = gate['down']   # actual gate center altitude — used for pass check
+            target_alt = max(gate_alt, 0.3)  # altitude to fly; floor at 0.3m
 
             logger.info(f"--- Gate {gid}: N={g_n:.1f} E={g_e:.1f} alt={target_alt:.1f}m ---")
 
@@ -335,7 +366,7 @@ class FlightController:
                 de   = g_e - e
                 dist = math.sqrt(dn * dn + de * de)
 
-                if dist < GATE_RADIUS_M:
+                if dist < GATE_RADIUS_M and abs(cur_alt - gate_alt) < GATE_HALF_HEIGHT:
                     logger.info(f"  Gate {gid} passed! pos=({n:.1f},{e:.1f},{cur_alt:.1f}m)")
                     break
 
@@ -346,21 +377,31 @@ class FlightController:
                 # NOTE: positive yaw_rate = counterclockwise in this sim (sign flipped vs NED)
                 yaw_rate = max(-MAX_YAW_RATE, min(MAX_YAW_RATE, -yaw_err * YAW_KP))
 
-                # Altitude P-controller: positive error = too high = reduce thrust
+                # Altitude PD-controller: P on position error, D on vertical velocity.
+                # D-term brakes upward momentum before overshooting the target altitude.
                 alt_err = cur_alt - target_alt
+                vn, ve, vd = self._vel()
+                vert_vel = -vd  # NED z is down-positive; flip so upward = positive
                 thrust  = max(MIN_THRUST, min(MAX_THRUST,
-                              HOVER_THRUST - alt_err * THRUST_KP))
+                              HOVER_THRUST - alt_err * THRUST_KP - vert_vel * THRUST_KD))
 
-                # Pitch forward only when aligned AND close to target altitude
-                aligned = abs(yaw_err) < math.radians(30)
-                near_alt = alt_err < ALT_LEASH_M
-                pitch = FORWARD_PITCH if (aligned and near_alt) else 0.0
+                speed_h  = math.sqrt(vn * vn + ve * ve)
+                aligned  = abs(yaw_err) < math.radians(30)
+                near_alt = abs(alt_err) < ALT_LEASH_M
+                go       = aligned and near_alt and speed_h < MAX_SPEED_MPS
+                if go:
+                    pitch_rate = FORWARD_PITCH          # nose-down: fly toward gate
+                elif not near_alt and speed_h > DECEL_SPEED:
+                    pitch_rate = LEVEL_PITCH            # nose-up: shed speed while gaining alt
+                else:
+                    pitch_rate = 0.0                    # coast: turning or near speed cap
 
-                self._send_attitude_target(0.0, pitch, yaw_rate, thrust)
+                self._send_attitude_target(0.0, pitch_rate, yaw_rate, thrust)
                 logger.info(
                     f"  G{gid}: pos=({n:.1f},{e:.1f},{cur_alt:.1f}m) dist={dist:.1f}m "
-                    f"yaw={math.degrees(current_yaw):.0f}° err={math.degrees(yaw_err):.0f}° "
-                    f"T={thrust:.2f} pitch={'fwd' if pitch != 0.0 else 'hold'}"
+                    f"yaw={math.degrees(current_yaw):.0f}° yawerr={math.degrees(yaw_err):.0f}° "
+                    f"spd={speed_h:.1f} vz={vert_vel:.1f} T={thrust:.2f} "
+                    f"{'fwd' if go else ('lvl' if not near_alt and speed_h > DECEL_SPEED else 'cst')}"
                 )
                 time.sleep(0.05)
             else:
