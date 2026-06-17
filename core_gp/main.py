@@ -54,6 +54,7 @@ def main():
 
         fc.arm()
         target_down = fc.takeoff(alt_m=5.0)
+        print_gates(gate_store)
         fc.fly_forward(speed_mps=4.0, duration_s=5.0, target_down=target_down)
 
     except KeyboardInterrupt:

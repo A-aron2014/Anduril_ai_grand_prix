@@ -230,7 +230,7 @@ class FlightController:
         while time.monotonic() < deadline:
             self._send_position_target(
                 type_mask,
-                0.0, 0.0, 0.0,          # position: ignored
+                0.0, 0.0, -10.0,          # position: ignored
                 0.0, 0.0, -speed_mps,   # velocity: climb (vz negative = up in NED)
             )
             _, _, d = self._pos()
