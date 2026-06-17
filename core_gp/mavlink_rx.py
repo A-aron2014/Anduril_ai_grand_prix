@@ -97,6 +97,12 @@ class MAVLinkRX:
                 self.on_encapsulated_data(msg)
 
             # --------------------------------------------------------------------------------------
+            # COMMAND_ACK
+            # --------------------------------------------------------------------------------------
+            elif msg_type == "COMMAND_ACK":
+                self.on_command_ack(msg)
+
+            # --------------------------------------------------------------------------------------
             # ACTUATOR_OUTPUT_STATUS
             # --------------------------------------------------------------------------------------
             elif msg_type == "ACTUATOR_OUTPUT_STATUS":
@@ -119,8 +125,11 @@ class MAVLinkRX:
                 self.expected_num_track_chunks[track_data_transfer_id] = msg.packets
 
     def on_heartbeat(self, msg):
-        armed = msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-
+        self.data['armed']         = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        self.data['base_mode']     = msg.base_mode
+        self.data['custom_mode']   = msg.custom_mode
+        self.data['system_status'] = msg.system_status
+    time.sleep(2.0)
     def on_timesync(self, msg):
         request_time = msg.ts1
         response_time = msg.tc1
@@ -177,6 +186,13 @@ class MAVLinkRX:
         # last_gate_race_time - race time in seconds when last gate was passed
         data_type, sim_boot_time_ms, race_start_boot_time_ms, race_finish_time_ns, active_gate_index, last_gate_race_time = struct.unpack_from(
             "<BQqqIq", raw_payload)
+        import logging
+        logging.getLogger(__name__).debug(
+            f"RaceStatus: started={race_start_boot_time_ms} finished={race_finish_time_ns} gate={active_gate_index}"
+        )
+        self.data['race_started']  = race_start_boot_time_ms >= 0
+        self.data['race_finished'] = race_finish_time_ns >= 0
+        self.data['active_gate']   = active_gate_index
 
     def on_track_data_packet(self, msg):
         raw_payload = bytes(msg.data)
@@ -211,6 +227,12 @@ class MAVLinkRX:
             gate_id, position_ned_x, position_ned_y, position_ned_z, orientation_ned_w, orientation_ned_x, orientation_ned_y, orientation_ned_z, width, height = struct.unpack_from(
                 "<Hfffffffff", payload)
             payload = payload[38:]
+
+    def on_command_ack(self, msg):
+        import logging
+        logging.getLogger(__name__).info(
+            f"COMMAND_ACK: cmd={msg.command} result={msg.result}"
+        )
 
     def on_actuator_output_status(self, msg):
         time_boot_us = msg.time_usec

@@ -1,3 +1,6 @@
+from time import time
+
+
 def main():
     import time
     import threading
@@ -20,7 +23,7 @@ def main():
 
     # Wire gate data into the existing RX instance via monkey-patch
     gate_store = GateStore()
-
+    
     def _on_track_data(payload: bytes):
         import struct
         num_gates, = struct.unpack_from("<H", payload)
@@ -34,7 +37,7 @@ def main():
             payload = payload[38:]
             gates.append({
                 "gate_id": gate_id,
-                "north": pos_n, "east": pos_e, "down": pos_d,
+                "north": pos_n, "east": pos_e, "down": -pos_d + 1.5,
                 "orient": (ow, ox, oy, oz),
                 "width": width, "height": height,
             })
@@ -52,10 +55,11 @@ def main():
             daemon=True
         ).start()
 
+        fc.send_sim_reset()
+        time.sleep(6.0)          # sim needs ~5s after reset before race can start
         fc.arm()
-        target_down = fc.takeoff(alt_m=5.0)
-        print_gates(gate_store)
-        fc.fly_forward(speed_mps=4.0, duration_s=5.0, target_down=target_down)
+        fc.takeoff(alt_m=1.0)   # stay low — gate 0 center is at altitude ~0m
+        fc.fly_gates(gate_store)
 
     except KeyboardInterrupt:
         print("Interrupted — holding position.")
