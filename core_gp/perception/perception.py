@@ -181,7 +181,7 @@ class ObstacleDetector:
 
     def detect(self, frame: np.ndarray, body_velocity: np.ndarray) -> List[Obstacle]:
         """
-        frame: H×W×3 BGR
+        frame: HxWx3 BGR
         body_velocity: (vx, vy, vz) in body NED (m/s)
         Returns list of Obstacle in body-NED frame.
         """

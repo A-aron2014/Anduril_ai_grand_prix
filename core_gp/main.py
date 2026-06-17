@@ -37,7 +37,7 @@ def main():
             payload = payload[38:]
             gates.append({
                 "gate_id": gate_id,
-                "north": pos_n, "east": pos_e, "down": -pos_d + 1.5,
+                "north": pos_n, "east": pos_e+0.5, "down": -pos_d + 1.5,
                 "orient": (ow, ox, oy, oz),
                 "width": width, "height": height,
             })
@@ -47,7 +47,6 @@ def main():
 
     # FlightController uses sim_conn + shared_data directly — no second UDP socket
     fc = FlightController(sim_conn, shared_data, system_boot_ms)
-
     try:
         threading.Thread(
             target=print_gates,
@@ -57,8 +56,9 @@ def main():
 
         fc.send_sim_reset()
         time.sleep(6.0)          # sim needs ~5s after reset before race can start
+
         fc.arm()
-        fc.takeoff(alt_m=1.0)   # stay low — gate 0 center is at altitude ~0m
+        fc.takeoff(alt_m=0.5)   # stay low — gate 0 center is at altitude ~0m
         fc.fly_gates(gate_store)
 
     except KeyboardInterrupt:

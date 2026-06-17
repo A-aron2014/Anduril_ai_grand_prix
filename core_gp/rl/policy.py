@@ -45,9 +45,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List
 
 # Internal project modules.
-from state_estimator import VehicleState
-from perception.perception import GateObservation, Obstacle
-from guidance.guidance import GuidanceOutput
+from core.state_estimator import VehicleState
+from core_gp.perception.perception import GateObservation, Obstacle
+from core_gp.guidance.guidance import GuidanceOutput
 
 # Logger used for debugging and training information.
 logger = logging.getLogger(__name__)

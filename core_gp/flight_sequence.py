@@ -14,9 +14,10 @@ import struct
 import time
 import threading
 import logging
-
+import guidance.guidance as guidance
 from pymavlink import mavutil
-
+import numpy as np
+from core.state_estimator import VehicleState
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -318,97 +319,129 @@ class FlightController:
             self._send_position_target(type_mask, n, e, d, 0.0, 0.0, 0.0)
             time.sleep(0.05)
 
+
     def fly_gates(self, gate_store: 'GateStore', timeout_per_gate_s: float = 30.0):
-        """Navigate through every race gate in order using attitude rate control.
+            """
+            Navigate the full gate sequence. GuidanceAlgorithm owns sequencing
+            and yaw (straight-line, gate-to-gate); this method owns actuation
+            via attitude-rate thrust/yaw-rate PD loops.
+            """
+            from guidance.guidance import GuidanceAlgorithm, CourseMap
 
-        Gate 'down' values in this sim are altitudes (positive = above ground),
-        not NED Z — so target_alt = gate['down'] directly.
-        """
-        gates = gate_store.get_gates()
-        if not gates:
-            logger.warning("fly_gates: No gate data available — aborting.")
-            return
+            gates = gate_store.get_gates()
+            if not gates:
+                logger.warning("fly_gates: No gate data available — aborting.")
+                return
 
-        # Empirically: T≈0.10-0.13 maintains altitude at level flight. 0.13 is the setpoint.
-        # MIN below 0.13 → drone descends; MAX 0.85 → fast climb for large altitude gaps.
-        HOVER_THRUST       = 0.13
-        THRUST_KP          = 0.15   # thrust per metre of altitude error (P)
-        THRUST_KD          = 0.25   # thrust per m/s of vertical velocity (D — prevents overshoot)
-        MAX_THRUST         = 0.85
-        MIN_THRUST         = 0.05   # below hover so drone can actually descend when too high
-        YAW_KP             = 2.0    # rad/s per radian of yaw error
-        MAX_YAW_RATE       = 0.8
-        GATE_RADIUS_M      = 1.5    # horizontal radius to count gate as passed
-        GATE_HALF_HEIGHT   = .75   # half of 2.72m gate — altitude must be within this
-        ALT_LEASH_M        = 5.0    # forward pitch suspended when this far from target alt
-        MAX_SPEED_MPS      = 20.0   # hard speed cap — high enough to stay in fwd mode through gates
-        DECEL_SPEED        = 2.0    # below this, stop active backward pitch (prevent reverse)
-        FORWARD_PITCH      = -0.1   # rad/s: nose-down → forward
-        # LEVEL_PITCH is applied only when altitude gap is large (between gates 2-5).
-        # NOT applied for overspeed or misaligned — that caused gate-0 oscillation.
-        LEVEL_PITCH        = +0.1   # rad/s: nose-up → active deceleration + allows climb
+            gates_sorted = sorted(gates, key=lambda g: g['gate_id'])
 
-        for gate in sorted(gates, key=lambda g: g['gate_id']):
-            gid      = gate['gate_id']
-            g_n      = gate['north']
-            g_e      = gate['east']
-            gate_alt   = gate['down']   # actual gate center altitude — used for pass check
-            target_alt = max(gate_alt, 0.3)  # altitude to fly; floor at 0.3m
+            # CourseMap wants (north, east, down) tuples + a cruise speed.
+            # 'down' here is already the sim-corrected altitude value used
+            # by the rest of fly_gates (-pos_d + 1.5), so guidance and
+            # actuation share one consistent definition of gate altitude.
+            course_map = CourseMap()
+            course_map.load_from_list(
+                [(g['north'], g['east'], g['down']) for g in gates_sorted],
+                speed=8.0,   # cruise speed_mps fed into the speed scheduler
+            )
+            guidance = GuidanceAlgorithm(course_map=course_map)
 
-            logger.info(f"--- Gate {gid}: N={g_n:.1f} E={g_e:.1f} alt={target_alt:.1f}m ---")
+            HOVER_THRUST     = 0.13
+            THRUST_KP        = 0.15
+            THRUST_KD        = 0.25
+            MAX_THRUST       = 0.85
+            MIN_THRUST       = 0.05
+            YAW_KP           = 2.0
+            MAX_YAW_RATE     = 0.8
+            GATE_RADIUS_M    = 1.5
+            GATE_HALF_HEIGHT = 0.75
+            ALT_LEASH_M      = 5.0
+            MAX_SPEED_MPS    = 20.0
+            DECEL_SPEED      = 2.0
+            FORWARD_PITCH    = -0.1
+            LEVEL_PITCH      = +0.1
 
-            deadline = time.monotonic() + timeout_per_gate_s
+            deadline = time.monotonic() + timeout_per_gate_s * len(gates_sorted)
             while time.monotonic() < deadline:
+
                 n, e, cur_d = self._pos()
-                cur_alt = -cur_d  # NED Z → altitude
+                cur_d = -cur_d #invert 
+                state = VehicleState(
+                    north=n,
+                    east=e,
+                    down=cur_d,
+                    yaw=self._yaw(),
+                )
 
-                dn   = g_n - n
-                de   = g_e - e
-                dist = math.sqrt(dn * dn + de * de)
+                output = guidance.compute(state=state, gates=gates_sorted, obstacles=[])
 
-                if dist < GATE_RADIUS_M and abs(cur_alt - gate_alt) < GATE_HALF_HEIGHT:
-                    logger.info(f"  Gate {gid} passed! pos=({n:.1f},{e:.1f},{cur_alt:.1f}m)")
+                if output.course_complete:
+                    logger.info("All gates navigated.")
                     break
 
-                # Bearing to gate in NED frame: atan2(east_delta, north_delta)
-                desired_yaw = math.atan2(de, dn)
+                gid = guidance.sequencer.index
+                gate = gates_sorted[min(gid, len(gates_sorted) - 1)]
+
+                # REMOVED: gate_alt = gate['down']; target_alt = max(gate_alt, 0.3)
+                # Altitude now comes from guidance's line-following interpolation,
+                # not a hard snap to the next gate's altitude.
+                target_alt = output.target_altitude
+
+                cur_alt = cur_d
+
+                dn = gate['north'] - n
+                de = gate['east'] - e
+                dist = math.sqrt(dn * dn + de * de)
+
+                if dist < GATE_RADIUS_M and abs(cur_alt - gate['down']) < GATE_HALF_HEIGHT:
+                    logger.info(f"  Gate {gate['gate_id']} passed! pos=({n:.1f},{e:.1f},{cur_alt:.1f}m)")
+
+                desired_yaw = output.target_yaw
                 current_yaw = self._yaw()
                 yaw_err = (desired_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
-                # NOTE: positive yaw_rate = counterclockwise in this sim (sign flipped vs NED)
                 yaw_rate = max(-MAX_YAW_RATE, min(MAX_YAW_RATE, -yaw_err * YAW_KP))
 
-                # Altitude PD-controller: P on position error, D on vertical velocity.
-                # D-term brakes upward momentum before overshooting the target altitude.
                 alt_err = cur_alt - target_alt
                 vn, ve, vd = self._vel()
-                vert_vel = -vd  # NED z is down-positive; flip so upward = positive
-                thrust  = max(MIN_THRUST, min(MAX_THRUST,
-                              HOVER_THRUST - alt_err * THRUST_KP - vert_vel * THRUST_KD))
+                vert_vel = -vd
+                thrust = max(MIN_THRUST, min(MAX_THRUST,
+                            HOVER_THRUST - alt_err * THRUST_KP - vert_vel * THRUST_KD))
 
                 speed_h  = math.sqrt(vn * vn + ve * ve)
                 aligned  = abs(yaw_err) < math.radians(30)
                 near_alt = abs(alt_err) < ALT_LEASH_M
                 go       = aligned and near_alt and speed_h < MAX_SPEED_MPS
                 if go:
-                    pitch_rate = FORWARD_PITCH          # nose-down: fly toward gate
+                    pitch_rate = FORWARD_PITCH
                 elif not near_alt and speed_h > DECEL_SPEED:
-                    pitch_rate = LEVEL_PITCH            # nose-up: shed speed while gaining alt
+                    pitch_rate = LEVEL_PITCH
                 else:
-                    pitch_rate = 0.0                    # coast: turning or near speed cap
+                    pitch_rate = 0.0
 
                 self._send_attitude_target(0.0, pitch_rate, yaw_rate, thrust)
                 logger.info(
-                    f"  G{gid}: pos=({n:.1f},{e:.1f},{cur_alt:.1f}m) dist={dist:.1f}m "
+                    f"  G{gate['gate_id']}: pos=({n:.1f},{e:.1f},{cur_alt:.1f}m) dist={dist:.1f}m "
                     f"yaw={math.degrees(current_yaw):.0f}° yawerr={math.degrees(yaw_err):.0f}° "
                     f"spd={speed_h:.1f} vz={vert_vel:.1f} T={thrust:.2f} "
                     f"{'fwd' if go else ('lvl' if not near_alt and speed_h > DECEL_SPEED else 'cst')}"
                 )
+                # --- DIAGNOSTIC: line segment internals at this tick ---
+                # Remove once the yaw-flip bug is confirmed fixed.
+                _chi_line_deg = math.degrees(
+                    math.atan2(guidance._line_dir_e, guidance._line_dir_n)
+                )
+                logger.info(
+                    f"    LINE: seq_idx={guidance.sequencer.index} "
+                    f"origin=({guidance._line_origin_n:.1f},{guidance._line_origin_e:.1f}) "
+                    f"dir=({guidance._line_dir_n:.2f},{guidance._line_dir_e:.2f}) "
+                    f"chi_line={_chi_line_deg:.0f}° "
+                    f"target_yaw={math.degrees(output.target_yaw):.0f}°"
+                )
                 time.sleep(0.05)
             else:
-                logger.warning(f"Gate {gid} navigation timed out!")
+                logger.warning("fly_gates: overall timeout reached.")
 
-        logger.info("All gates navigated.")
-        self.hold_position()
+            self.hold_position()
 
 
 # ---------------------------------------------------------------------------
