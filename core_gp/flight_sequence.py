@@ -336,24 +336,22 @@ class FlightController:
         THRUST_KD          = 0.25   # thrust per m/s of vertical velocity (D — prevents overshoot)
         MAX_THRUST         = 0.85
         MIN_THRUST         = 0.05   # below hover so drone can actually descend when too high
-        YAW_KP             = 2.0    # rad/s per radian of yaw error
-        MAX_YAW_RATE       = 0.8
+        YAW_KP             = 3.0    # rad/s per radian of yaw error
+        MAX_YAW_RATE       = 1.2
         GATE_RADIUS_M      = 1.5    # horizontal radius to count gate as passed
         GATE_HALF_HEIGHT   = .75   # half of 2.72m gate — altitude must be within this
         ALT_LEASH_M        = 5.0    # forward pitch suspended when this far from target alt
-        MAX_SPEED_MPS      = 20.0   # hard speed cap — high enough to stay in fwd mode through gates
+        MAX_SPEED_MPS      = 8.0    # speed cap — drone brakes actively above this
         DECEL_SPEED        = 2.0    # below this, stop active backward pitch (prevent reverse)
-        FORWARD_PITCH      = -0.1   # rad/s: nose-down → forward
-        # LEVEL_PITCH is applied only when altitude gap is large (between gates 2-5).
-        # NOT applied for overspeed or misaligned — that caused gate-0 oscillation.
+        FORWARD_PITCH      = -0.041  # rad/s: nose-down → forward
         LEVEL_PITCH        = +0.1   # rad/s: nose-up → active deceleration + allows climb
 
         for gate in sorted(gates, key=lambda g: g['gate_id']):
             gid      = gate['gate_id']
             g_n      = gate['north']
             g_e      = gate['east']
-            gate_alt   = gate['down']   # actual gate center altitude — used for pass check
-            target_alt = max(gate_alt, 0.3)  # altitude to fly; floor at 0.3m
+            gate_alt   = gate['down']   # actual gate center altitude
+            target_alt = gate_alt       # terrain descends — allow negative NED altitudes
 
             logger.info(f"--- Gate {gid}: N={g_n:.1f} E={g_e:.1f} alt={target_alt:.1f}m ---")
 
@@ -386,15 +384,18 @@ class FlightController:
                               HOVER_THRUST - alt_err * THRUST_KP - vert_vel * THRUST_KD))
 
                 speed_h  = math.sqrt(vn * vn + ve * ve)
-                aligned  = abs(yaw_err) < math.radians(30)
+                aligned  = abs(yaw_err) < math.radians(15)
                 near_alt = abs(alt_err) < ALT_LEASH_M
-                go       = aligned and near_alt and speed_h < MAX_SPEED_MPS
+                overspeed = speed_h >= MAX_SPEED_MPS
+                go       = aligned and near_alt and not overspeed
                 if go:
                     pitch_rate = FORWARD_PITCH          # nose-down: fly toward gate
-                elif not near_alt and speed_h > DECEL_SPEED:
-                    pitch_rate = LEVEL_PITCH            # nose-up: shed speed while gaining alt
+                elif overspeed and aligned:
+                    pitch_rate = LEVEL_PITCH            # nose-up: active braking when too fast
+                elif not near_alt and alt_err < 0 and speed_h > DECEL_SPEED:
+                    pitch_rate = LEVEL_PITCH            # nose-up: slow down to allow climb
                 else:
-                    pitch_rate = 0.0                    # coast: turning or near speed cap
+                    pitch_rate = 0.0                    # coast: descending or turning
 
                 self._send_attitude_target(0.0, pitch_rate, yaw_rate, thrust)
                 logger.info(
