@@ -170,6 +170,8 @@ class FlightController:
     def _send_position_target(self, type_mask, x, y, z, vx, vy, vz):
         # time_boot_ms must fit in uint32 — use ms since boot, not Unix epoch
         now_boot_ms = int(time.time() * 1000) - self._system_boot_ms
+
+        logger.info(f"type_mask={type_mask}")
         self.conn.mav.set_position_target_local_ned_send(
             now_boot_ms,
             self.conn.target_system,
@@ -250,7 +252,21 @@ class FlightController:
 
         deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
-            self._send_attitude_target(0.0, 0.0, 0.0, CLIMB_THRUST)
+            
+            #self._send_attitude_target(0.0, 0.0, 0.0, CLIMB_THRUST)
+            self._send_position_target(type_mask=(
+                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
+                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
+                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
+                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+                ),
+                x=0, y=0, z=0,  # ignored via type_mask
+                vx=0.0,
+                vy=0.0,
+                vz=CLIMB_THRUST
+            )
             _, _, d = self._pos()
             current_alt = -d
             logger.info(f"  Alt: {current_alt:.2f} m  (target {alt_m:.1f} m)")
@@ -269,15 +285,45 @@ class FlightController:
         settle_end = time.monotonic() + 4.0
         while time.monotonic() < settle_end:
             _, _, vd = self._vel()
+            logger.info(f"vd={vd}")
             _, _, d  = self._pos()
             alt_err  = (-d) - alt_m
             vert_vel = -vd
             thrust   = max(0.05, min(0.85, 0.13 - alt_err * 0.15 - vert_vel * 0.25))
-            self._send_attitude_target(0.0, 0.0, 0.0, thrust)
+            #self._send_attitude_target(0.0, 0.0, 0.0, thrust)
+            self._send_position_target(type_mask=(
+                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
+                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
+                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
+                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+                            ),
+                            x=0, y=0, z=0,  # ignored via type_mask
+                            vx=0.0,
+                            vy=0.0,
+                            vz=-thrust
+                        )
             if abs(vd) < 0.3:
                 logger.info("Vertical velocity settled.")
                 break
             time.sleep(0.05)
+
+        logger.info("STARTING VELOCITY TEST")
+
+        for _ in range(100):
+
+            self._send_position_target(
+                type_mask=455,
+                x=0,y=0,z=0,
+                vx=0,
+                vy=0,
+                vz=0
+            )
+
+            logger.info(self._vel())
+
+            time.sleep(0.05)   
         return target_down
 
     def fly_forward(self, duration_s: float = 5.0, target_down: float = None):
@@ -360,12 +406,20 @@ class FlightController:
             DECEL_SPEED      = 2.0
             FORWARD_PITCH    = -0.1
             LEVEL_PITCH      = +0.1
+            # Longitudinal velocity PD — replaces the old bang-bang
+            # FORWARD_PITCH / LEVEL_PITCH toggle. Pitch rate is now
+            # proportional to the gap between current speed and a
+            # target speed, the same way thrust already tracks altitude.
+            PITCH_KP        = 0.04   # rad/s of pitch rate per (m/s) speed error
+            MAX_PITCH_RATE  = 0.5    # rad/s cap, keep within safe attitude-rate bounds
+            APPROACH_DECEL_RADIUS = 8.0   # start braking this far from the gate
+            MIN_APPROACH_SPEED    = 3.0   # don't try to crawl to zero — keep some authority
 
             deadline = time.monotonic() + timeout_per_gate_s * len(gates_sorted)
             while time.monotonic() < deadline:
 
                 n, e, cur_d = self._pos()
-                cur_d = -cur_d #invert 
+                cur_d = cur_d #invert 
                 state = VehicleState(
                     north=n,
                     east=e,
@@ -378,53 +432,107 @@ class FlightController:
                 if output.course_complete:
                     logger.info("All gates navigated.")
                     break
-
-                gid = guidance.sequencer.index
-                gate = gates_sorted[min(gid, len(gates_sorted) - 1)]
-
-                # REMOVED: gate_alt = gate['down']; target_alt = max(gate_alt, 0.3)
-                # Altitude now comes from guidance's line-following interpolation,
-                # not a hard snap to the next gate's altitude.
-                target_alt = output.target_altitude
-
-                cur_alt = cur_d
-
-                dn = gate['north'] - n
-                de = gate['east'] - e
-                dist = math.sqrt(dn * dn + de * de)
-
-                if dist < GATE_RADIUS_M and abs(cur_alt - gate['down']) < GATE_HALF_HEIGHT:
-                    logger.info(f"  Gate {gate['gate_id']} passed! pos=({n:.1f},{e:.1f},{cur_alt:.1f}m)")
-
-                desired_yaw = output.target_yaw
-                current_yaw = self._yaw()
-                yaw_err = (desired_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
-                yaw_rate = max(-MAX_YAW_RATE, min(MAX_YAW_RATE, -yaw_err * YAW_KP))
-
-                alt_err = cur_alt - target_alt
-                vn, ve, vd = self._vel()
-                vert_vel = -vd
-                thrust = max(MIN_THRUST, min(MAX_THRUST,
-                            HOVER_THRUST - alt_err * THRUST_KP - vert_vel * THRUST_KD))
-
-                speed_h  = math.sqrt(vn * vn + ve * ve)
-                aligned  = abs(yaw_err) < math.radians(30)
-                near_alt = abs(alt_err) < ALT_LEASH_M
-                go       = aligned and near_alt and speed_h < MAX_SPEED_MPS
-                if go:
-                    pitch_rate = FORWARD_PITCH
-                elif not near_alt and speed_h > DECEL_SPEED:
-                    pitch_rate = LEVEL_PITCH
-                else:
-                    pitch_rate = 0.0
-
-                self._send_attitude_target(0.0, pitch_rate, yaw_rate, thrust)
-                logger.info(
-                    f"  G{gate['gate_id']}: pos=({n:.1f},{e:.1f},{cur_alt:.1f}m) dist={dist:.1f}m "
-                    f"yaw={math.degrees(current_yaw):.0f}° yawerr={math.degrees(yaw_err):.0f}° "
-                    f"spd={speed_h:.1f} vz={vert_vel:.1f} T={thrust:.2f} "
-                    f"{'fwd' if go else ('lvl' if not near_alt and speed_h > DECEL_SPEED else 'cst')}"
+                self._send_position_target(type_mask=(
+                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
+                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
+                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
+                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+                    ),
+                    x=0, y=0, z=0,  # ignored via type_mask
+                    vx=output.target_velocity[0],
+                    vy=output.target_velocity[1],
+                    vz=output.target_velocity[2],
                 )
+
+                logger.info(
+                    f"POS=({n:.1f},{e:.1f},{cur_d:.1f}) "
+                    f"VEL_CMD=({output.target_velocity[0]:.1f},"
+                    f"{output.target_velocity[1]:.1f},"
+                    f"{output.target_velocity[2]:.1f}) "
+                    f"YAW={math.degrees(output.target_yaw):.1f}"
+                )
+
+                vn, ve, vd = self._vel()
+
+                logger.info(
+                    f"ACTUAL_VEL=({vn:.1f},{ve:.1f},{vd:.1f})"
+                )
+
+                logger.info(
+                    f"POS=({n:.1f},{e:.1f},{cur_d:.1f}) "
+                    f"VEL_CMD=({output.target_velocity[0]:.1f},"
+                    f"{output.target_velocity[1]:.1f},"
+                    f"{output.target_velocity[2]:.1f}) "
+                    f"ACTUAL=({vn:.1f},{ve:.1f},{vd:.1f})"
+                )
+                # self._send_position_target(cmd.type_mask, 0, 0, 0,
+                #                             cmd.target_vn, cmd.target_ve, cmd.target_vd)
+                # gid = guidance.sequencer.index
+                # gate = gates_sorted[min(gid, len(gates_sorted) - 1)]
+
+                # # REMOVED: gate_alt = gate['down']; target_alt = max(gate_alt, 0.3)
+                # # Altitude now comes from guidance's line-following interpolation,
+                # # not a hard snap to the next gate's altitude.
+                # target_alt = output.target_altitude
+
+                # cur_alt = cur_d
+
+                # dn = gate['north'] - n
+                # de = gate['east'] - e
+                # dist = math.sqrt(dn * dn + de * de)
+
+                # if dist < GATE_RADIUS_M and abs(cur_alt - gate['down']) < GATE_HALF_HEIGHT:
+                #     logger.info(f"  Gate {gate['gate_id']} passed! pos=({n:.1f},{e:.1f},{cur_alt:.1f}m)")
+
+                # desired_yaw = output.target_yaw
+                # current_yaw = self._yaw()
+                # yaw_err = (desired_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
+                # yaw_rate = max(-MAX_YAW_RATE, min(MAX_YAW_RATE, -yaw_err * YAW_KP))
+
+                # alt_err = cur_alt - target_alt
+                # vn, ve, vd = self._vel()
+                # vert_vel = -vd
+                # thrust = max(MIN_THRUST, min(MAX_THRUST,
+                #             HOVER_THRUST - alt_err * THRUST_KP - vert_vel * THRUST_KD))
+
+                # speed_h  = math.sqrt(vn * vn + ve * ve)
+                # aligned  = abs(yaw_err) < math.radians(30)
+                # near_alt = abs(alt_err) < ALT_LEASH_M
+                # # go       = aligned and near_alt and speed_h < MAX_SPEED_MPS
+                # # if go:
+                # #     pitch_rate = FORWARD_PITCH
+                # # elif not near_alt and speed_h > DECEL_SPEED:
+                # #     pitch_rate = LEVEL_PITCH
+                # # else:
+                # #     pitch_rate = 0.0
+                # # Target speed shrinks as we approach the gate, so the
+
+                # # drone arrives slow enough for yaw correction to actually
+                # # converge before passing through.
+                # if dist < APPROACH_DECEL_RADIUS:
+                #     # Linear ramp from cruise speed down to MIN_APPROACH_SPEED
+                #     # as dist goes from APPROACH_DECEL_RADIUS -> 0.
+                #     frac = dist / APPROACH_DECEL_RADIUS
+                #     target_speed = MIN_APPROACH_SPEED + frac * (guidance.max_speed - MIN_APPROACH_SPEED)
+                # else:
+                #     target_speed = guidance.max_speed   # or guidance._compute_speed(), see below
+
+                # speed_err = speed_h - target_speed
+                # # Positive speed_err (too fast) -> nose up (positive pitch_rate, decelerate)
+                # # Negative speed_err (too slow)  -> nose down (negative pitch_rate, accelerate)
+                # pitch_rate = max(-MAX_PITCH_RATE, min(MAX_PITCH_RATE, speed_err * PITCH_KP))
+
+                # Altitude and yaw thrust/yaw_rate computation unchanged below this point
+
+                # self._send_attitude_target(0.0, pitch_rate, yaw_rate, thrust)
+                # logger.info(
+                #     f"  G{gate['gate_id']}: pos=({n:.1f},{e:.1f},{cur_alt:.1f}m) dist={dist:.1f}m "
+                #     f"yaw={math.degrees(current_yaw):.0f}° yawerr={math.degrees(yaw_err):.0f}° "
+                #     f"spd={speed_h:.1f} vz={vert_vel:.1f} T={thrust:.2f} "
+                    #f"{'fwd' if go else ('lvl' if not near_alt and speed_h > DECEL_SPEED else 'cst')}"
+                # )
                 # --- DIAGNOSTIC: line segment internals at this tick ---
                 # Remove once the yaw-flip bug is confirmed fixed.
                 _chi_line_deg = math.degrees(

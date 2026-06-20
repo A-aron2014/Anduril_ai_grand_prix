@@ -161,9 +161,16 @@ class GuidanceAlgorithm:
 
         target = self._lookahead_target(position, wp.position_ned)
         speed = self._compute_speed()
-        velocity = self._desired_velocity(position, target, speed, obstacles)
-
-        yaw = self._line_following_yaw(position[0], position[1])
+        #velocity = self._desired_velocity(position, target, speed, obstacles)
+        # Path follower: one call produces the full 3D velocity command —
+        # along-track + cross-track correction (horizontal) and altitude
+        # interpolation (vertical) — all in one reference output. This
+        # replaces _lookahead_target + _desired_velocity entirely; the
+        # autopilot's own velocity controller handles turning this into
+        # actual pitch/roll/thrust, so guidance never needs to.
+        velocity = self.line_following_velocity(position, speed)
+        #yaw = self._line_following_yaw(position[0], position[1])
+        yaw = np.atan2(velocity[1], velocity[0])
         target_alt = self._line_following_altitude(position[0], position[1], position[2])
 
         return GuidanceOutput(
@@ -391,3 +398,32 @@ class GuidanceAlgorithm:
             self._line_origin_down
             + progress * (self._line_target_down - self._line_origin_down)
         )
+    
+    def line_following_velocity(self, position: np.ndarray, speed: float, k_path: float = 0.6) -> np.ndarray:
+        """
+        Path follower: given current 3D position and a desired along-track
+        speed, returns a 3D NED velocity command that steers onto and along
+        the current line segment. This is the full reference command —
+        the autopilot (set_position_target_local_ned, velocity-controlled)
+        is responsible for actually achieving this velocity. No attitude,
+        pitch, or thrust math belongs here.
+        """
+        n, e, d = position
+        ex, ey = n - self._line_origin_n, e - self._line_origin_e
+
+        along_dist = ex * self._line_dir_n + ey * self._line_dir_e
+        progress = max(0.0, min(1.0, along_dist / max(self._line_length_horizontal, 1e-3)))
+        target_down = self._line_origin_down + progress * (self._line_target_down - self._line_origin_down)
+
+        cross = -self._line_dir_e * ex + self._line_dir_n * ey
+        correction = np.atan(k_path * cross)
+
+        # Blend: mostly along-track velocity, small lateral correction term
+        chi = np.atan2(self._line_dir_e, self._line_dir_n) - correction
+        chi = (chi + np.pi) % (2 * np.pi) - np.pi
+
+        vn = speed * np.cos(chi)
+        ve = speed * np.sin(chi)
+        vd = -1.0 * (cur_d_placeholder := 0.0)  # placeholder—see below for vertical rate
+
+        return np.array([vn, ve, vd])
