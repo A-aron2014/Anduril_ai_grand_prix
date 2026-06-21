@@ -135,11 +135,20 @@ class VisionStreamReceiver:
         self._sock.settimeout(1.0)
         self._thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._thread.start()
+        # The decode queue this thread drains was being filled by
+        # _recv_loop but nothing ever consumed it -- get_latest_frame()
+        # would silently return None forever without this thread running.
+        self._decode_thread = threading.Thread(target=self._decode_loop, daemon=True)
+        self._decode_thread.start()
         logger.info(f"Vision stream listening on {self.host}:{self.port}")
 
     def stop(self):
         self._running = False
         self._sock.close()
+
+    def get_thread_for_join(self):
+        self.stop()
+        return getattr(self, '_thread', None)
 
     def get_latest_frame(self) -> Optional[tuple]:
         """Returns (frame_np, sim_time_ns) or None. Thread-safe."""
@@ -239,7 +248,3 @@ class VisionStreamReceiver:
                 except Exception as e:
                     logger.error(f"Frame callback error: {e}")
 
-    def _purge_stale(self):
-        stale = [fid for fid, buf in self._buffers.items() if buf.is_stale(self.max_buffer_age)]
-        for fid in stale:
-            del self._buffers[fid]

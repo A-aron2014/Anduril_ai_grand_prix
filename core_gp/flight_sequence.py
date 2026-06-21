@@ -113,10 +113,23 @@ class FlightController:
     No second UDP socket is opened.
     """
 
-    TAKEOFF_ALT_M   = 0.1   # metres above arm point (positive up)
-    TAKEOFF_SPEED   = 0.1   # m/s upward during climb
-    FORWARD_SPEED   = 0.1   # m/s north during forward flight
-    ALT_THRESHOLD_M = 0.01   # metres — "close enough" to target alt
+    FORWARD_SPEED   = 0.1   # m/s north during forward flight (used by fly_forward only)
+
+    # Shared by every MPC-driven phase (takeoff, racing) — see _run_mpc_phase.
+    # Position + velocity together. Confirmed empirically: velocity-only
+    # (position ignored) produced *zero* response from the sim — it just
+    # sat there. Position+velocity got a real response (smooth takeoff
+    # climb), but the first attempt sent a position target only an
+    # infinitesimal step from the current position alongside a large
+    # velocity feedforward, which is an internally inconsistent reference
+    # for a position-tracking controller and likely caused the vertical
+    # runaway seen during racing. MPCGuidance now sends a real lead point
+    # (position_lookahead_steps into its own predicted trajectory) instead.
+    SEND_TYPE_MASK = (
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
+        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+    )
 
     def __init__(self, sim_conn, shared_data: dict, system_boot_ms: int = None):
         self.conn = sim_conn
@@ -239,92 +252,97 @@ class FlightController:
             time.sleep(0.5)
         logger.warning("Arm confirmation timed out — proceeding anyway.")
 
-    def takeoff(self, alt_m: float = None) -> float:
-        alt_m       = alt_m     or self.TAKEOFF_ALT_M
-        target_down = -alt_m  # NED: up is negative
+    def _run_mpc_phase(self, guidance, timeout_s: float, phase_label: str) -> bool:
+        """
+        Drives one MPCGuidance instance to completion. Each tick: read
+        telemetry, ask guidance for the next position+velocity reference,
+        forward it straight to the sim's onboard controller. No PID layer
+        here — the sim's autopilot already closes the position/velocity ->
+        attitude/thrust loop, so this is the same actuation path for every
+        phase (takeoff, racing) instead of each phase hand-rolling its own
+        thrust formula.
 
-        logger.info(f"Taking off to {alt_m} m AGL (attitude control)...")
-        self._wait_for_telemetry()
-
-        # Attitude rate mode: zero body rates (hold level), thrust above hover to climb.
-        # 0.6 ≈ hover per reference; 0.75 should produce a steady climb.
-        CLIMB_THRUST = 0.7
-
-        deadline = time.monotonic() + 30.0
+        Returns True if the phase's guidance reported course_complete,
+        False if it timed out.
+        """
+        deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            
-            #self._send_attitude_target(0.0, 0.0, 0.0, CLIMB_THRUST)
-            self._send_position_target(type_mask=(
-                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
-                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
-                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
-                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
-                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
-                    mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
-                ),
-                x=0, y=0, z=0,  # ignored via type_mask
-                vx=0.0,
-                vy=0.0,
-                vz=CLIMB_THRUST
+            n, e, cur_d = self._pos()
+            vn, ve, vd = self._vel()
+            state = VehicleState(
+                north=n, east=e, down=cur_d,
+                vn=vn, ve=ve, vd=vd,
+                yaw=self._yaw(),
             )
-            _, _, d = self._pos()
-            current_alt = -d
-            logger.info(f"  Alt: {current_alt:.2f} m  (target {alt_m:.1f} m)")
-            if current_alt >= alt_m - self.ALT_THRESHOLD_M:
-                logger.info("Takeoff complete.")
-                break
-            time.sleep(0.05)
-        else:
-            logger.warning("Takeoff timed out — proceeding anyway.")
-            return target_down
 
-        # Settle: hold altitude until vertical velocity is calm before starting gate flight.
-        # Without this, the drone enters fly_gates with 7+ m/s upward velocity and
-        # oscillates wildly around the first gate's altitude target.
-        logger.info("Settling — waiting for vertical velocity < 0.3 m/s...")
-        settle_end = time.monotonic() + 4.0
-        while time.monotonic() < settle_end:
-            _, _, vd = self._vel()
-            logger.info(f"vd={vd}")
-            _, _, d  = self._pos()
-            alt_err  = (-d) - alt_m
-            vert_vel = -vd
-            thrust   = max(0.05, min(0.85, 0.13 - alt_err * 0.15 - vert_vel * 0.25))
-            #self._send_attitude_target(0.0, 0.0, 0.0, thrust)
-            self._send_position_target(type_mask=(
-                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
-                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
-                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
-                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
-                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
-                                mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
-                            ),
-                            x=0, y=0, z=0,  # ignored via type_mask
-                            vx=0.0,
-                            vy=0.0,
-                            vz=-thrust
-                        )
-            if abs(vd) < 0.3:
-                logger.info("Vertical velocity settled.")
-                break
-            time.sleep(0.05)
+            output = guidance.compute(state=state, gates=[], obstacles=[])
 
-        logger.info("STARTING VELOCITY TEST")
-
-        for _ in range(100):
+            if output.course_complete:
+                logger.info(f"{phase_label}: complete ({guidance.status_string()}).")
+                # Send an explicit hold immediately instead of just returning —
+                # otherwise the autopilot keeps tracking whatever the *last*
+                # in-flight command was (e.g. a climb) for however long it
+                # takes the next phase to construct its guidance and send its
+                # first command, which showed up as a multi-m/s velocity jump
+                # at the takeoff->race transition.
+                self.hold_position()
+                return True
 
             self._send_position_target(
-                type_mask=455,
-                x=0,y=0,z=0,
-                vx=0,
-                vy=0,
-                vz=0
+                type_mask=self.SEND_TYPE_MASK,
+                x=output.target_position[0],
+                y=output.target_position[1],
+                z=output.target_position[2],
+                vx=output.target_velocity[0],
+                vy=output.target_velocity[1],
+                vz=output.target_velocity[2],
             )
 
-            logger.info(self._vel())
+            logger.info(
+                f"[{phase_label}] POS=({n:.1f},{e:.1f},{cur_d:.1f}) "
+                f"VEL_CMD=({output.target_velocity[0]:.1f},"
+                f"{output.target_velocity[1]:.1f},"
+                f"{output.target_velocity[2]:.1f}) "
+                f"TARGET_POS=({output.target_position[0]:.1f},"
+                f"{output.target_position[1]:.1f},"
+                f"{output.target_position[2]:.1f}) "
+                f"ACTUAL_VEL=({vn:.1f},{ve:.1f},{vd:.1f}) "
+                f"YAW={math.degrees(output.target_yaw):.1f} "
+                f"MPC: {guidance.status_string()}"
+            )
+            time.sleep(0.05)
 
-            time.sleep(0.05)   
-        return target_down
+        logger.warning(f"{phase_label}: timeout reached.")
+        return False
+
+    def takeoff_mpc(self, climb_alt_m: float = 0.5, timeout_s: float = 15.0):
+        """
+        Climbs straight up to climb_alt_m AGL using the same MPC controller
+        fly_gates uses for racing — takeoff is just a course with a single
+        waypoint directly above the arm point. Replaces the old hand-tuned
+        thrust-formula takeoff()/settle loop, whose floor on the thrust term
+        (max(0.05, ...)) could never command a brake or descent and would
+        run away indefinitely once climbing too fast.
+        """
+        from guidance.mpc_guidance import MPCGuidance, MPCConfig
+        from guidance.guidance import CourseMap
+
+        logger.info(f"Taking off to {climb_alt_m} m AGL via MPC...")
+        self._wait_for_telemetry()
+
+        n, e, d = self._pos()
+        target_down = d - climb_alt_m   # NED: climbing decreases 'down'
+
+        course_map = CourseMap()
+        course_map.load_from_list([(n, e, target_down)], speed=1.5)
+        # Default pass_distance (1.5 m) is tuned for gates, not a single
+        # point target — with a short climb (e.g. 0.5 m) it would report
+        # course_complete on the very first tick. Use a tight tolerance
+        # instead so takeoff actually climbs before declaring done.
+        cfg = MPCConfig(pass_distance=min(0.15, climb_alt_m / 2))
+        guidance = MPCGuidance(course_map=course_map, config=cfg)
+
+        self._run_mpc_phase(guidance, timeout_s, "TAKEOFF")
 
     def fly_forward(self, duration_s: float = 5.0, target_down: float = None):
         _, _, cur_d = self._pos()
@@ -368,11 +386,16 @@ class FlightController:
 
     def fly_gates(self, gate_store: 'GateStore', timeout_per_gate_s: float = 30.0):
             """
-            Navigate the full gate sequence. GuidanceAlgorithm owns sequencing
-            and yaw (straight-line, gate-to-gate); this method owns actuation
-            via attitude-rate thrust/yaw-rate PD loops.
+            Navigate the full gate sequence. MPCGuidance owns trajectory
+            generation (a continuous reference across the whole course, not
+            a fresh line segment per gate); _run_mpc_phase forwards its
+            position+velocity reference straight to the sim's onboard
+            controller. No PID layer here — the sim's autopilot already
+            closes the position/velocity -> attitude/thrust loop, so adding
+            a second feedback loop on top of guidance would just fight it.
             """
-            from guidance.guidance import GuidanceAlgorithm, CourseMap
+            from guidance.mpc_guidance import MPCGuidance
+            from guidance.guidance import CourseMap
 
             gates = gate_store.get_gates()
             if not gates:
@@ -380,6 +403,30 @@ class FlightController:
                 return
 
             gates_sorted = sorted(gates, key=lambda g: g['gate_id'])
+
+            # Sanity check before committing to a 100+ m/s climb: gate
+            # telemetry and drone position telemetry should be in the same
+            # local frame, so gate 0 should be within a sane distance of
+            # where the drone actually is. If it isn't, the two are coming
+            # from different coordinate frames this session (seen in
+            # practice: gate north/east in the thousands while the drone
+            # sits at ~(0,0,0)) and flying toward it just chases a phantom
+            # target as fast as the velocity clamps allow.
+            n, e, d = self._pos()
+            g0 = gates_sorted[0]
+            dist_to_gate0 = math.sqrt(
+                (g0['north'] - n) ** 2 + (g0['east'] - e) ** 2 + (g0['down'] - d) ** 2
+            )
+            if dist_to_gate0 > 500.0:
+                logger.error(
+                    f"fly_gates: gate 0 is {dist_to_gate0:.0f}m from current position "
+                    f"({n:.1f},{e:.1f},{d:.1f}) vs gate0=({g0['north']:.1f},{g0['east']:.1f},{g0['down']:.1f}). "
+                    f"This is almost certainly a coordinate-frame mismatch between gate "
+                    f"and drone telemetry, not a real course -- aborting rather than "
+                    f"flying toward a phantom target. Try a full simulator restart."
+                )
+                self.hold_position()
+                return
 
             # CourseMap wants (north, east, down) tuples + a cruise speed.
             # 'down' here is already the sim-corrected altitude value used
@@ -390,165 +437,9 @@ class FlightController:
                 [(g['north'], g['east'], g['down']) for g in gates_sorted],
                 speed=8.0,   # cruise speed_mps fed into the speed scheduler
             )
-            guidance = GuidanceAlgorithm(course_map=course_map)
+            guidance = MPCGuidance(course_map=course_map)
 
-            HOVER_THRUST     = 0.13
-            THRUST_KP        = 0.15
-            THRUST_KD        = 0.25
-            MAX_THRUST       = 0.85
-            MIN_THRUST       = 0.05
-            YAW_KP           = 2.0
-            MAX_YAW_RATE     = 0.8
-            GATE_RADIUS_M    = 1.5
-            GATE_HALF_HEIGHT = 0.75
-            ALT_LEASH_M      = 5.0
-            MAX_SPEED_MPS    = 20.0
-            DECEL_SPEED      = 2.0
-            FORWARD_PITCH    = -0.1
-            LEVEL_PITCH      = +0.1
-            # Longitudinal velocity PD — replaces the old bang-bang
-            # FORWARD_PITCH / LEVEL_PITCH toggle. Pitch rate is now
-            # proportional to the gap between current speed and a
-            # target speed, the same way thrust already tracks altitude.
-            PITCH_KP        = 0.04   # rad/s of pitch rate per (m/s) speed error
-            MAX_PITCH_RATE  = 0.5    # rad/s cap, keep within safe attitude-rate bounds
-            APPROACH_DECEL_RADIUS = 8.0   # start braking this far from the gate
-            MIN_APPROACH_SPEED    = 3.0   # don't try to crawl to zero — keep some authority
-
-            deadline = time.monotonic() + timeout_per_gate_s * len(gates_sorted)
-            while time.monotonic() < deadline:
-
-                n, e, cur_d = self._pos()
-                cur_d = cur_d #invert 
-                state = VehicleState(
-                    north=n,
-                    east=e,
-                    down=cur_d,
-                    yaw=self._yaw(),
-                )
-
-                output = guidance.compute(state=state, gates=gates_sorted, obstacles=[])
-
-                if output.course_complete:
-                    logger.info("All gates navigated.")
-                    break
-                self._send_position_target(type_mask=(
-                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE |
-                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE |
-                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE |
-                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
-                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
-                        mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
-                    ),
-                    x=0, y=0, z=0,  # ignored via type_mask
-                    vx=output.target_velocity[0],
-                    vy=output.target_velocity[1],
-                    vz=output.target_velocity[2],
-                )
-
-                logger.info(
-                    f"POS=({n:.1f},{e:.1f},{cur_d:.1f}) "
-                    f"VEL_CMD=({output.target_velocity[0]:.1f},"
-                    f"{output.target_velocity[1]:.1f},"
-                    f"{output.target_velocity[2]:.1f}) "
-                    f"YAW={math.degrees(output.target_yaw):.1f}"
-                )
-
-                vn, ve, vd = self._vel()
-
-                logger.info(
-                    f"ACTUAL_VEL=({vn:.1f},{ve:.1f},{vd:.1f})"
-                )
-
-                logger.info(
-                    f"POS=({n:.1f},{e:.1f},{cur_d:.1f}) "
-                    f"VEL_CMD=({output.target_velocity[0]:.1f},"
-                    f"{output.target_velocity[1]:.1f},"
-                    f"{output.target_velocity[2]:.1f}) "
-                    f"ACTUAL=({vn:.1f},{ve:.1f},{vd:.1f})"
-                )
-                # self._send_position_target(cmd.type_mask, 0, 0, 0,
-                #                             cmd.target_vn, cmd.target_ve, cmd.target_vd)
-                # gid = guidance.sequencer.index
-                # gate = gates_sorted[min(gid, len(gates_sorted) - 1)]
-
-                # # REMOVED: gate_alt = gate['down']; target_alt = max(gate_alt, 0.3)
-                # # Altitude now comes from guidance's line-following interpolation,
-                # # not a hard snap to the next gate's altitude.
-                # target_alt = output.target_altitude
-
-                # cur_alt = cur_d
-
-                # dn = gate['north'] - n
-                # de = gate['east'] - e
-                # dist = math.sqrt(dn * dn + de * de)
-
-                # if dist < GATE_RADIUS_M and abs(cur_alt - gate['down']) < GATE_HALF_HEIGHT:
-                #     logger.info(f"  Gate {gate['gate_id']} passed! pos=({n:.1f},{e:.1f},{cur_alt:.1f}m)")
-
-                # desired_yaw = output.target_yaw
-                # current_yaw = self._yaw()
-                # yaw_err = (desired_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
-                # yaw_rate = max(-MAX_YAW_RATE, min(MAX_YAW_RATE, -yaw_err * YAW_KP))
-
-                # alt_err = cur_alt - target_alt
-                # vn, ve, vd = self._vel()
-                # vert_vel = -vd
-                # thrust = max(MIN_THRUST, min(MAX_THRUST,
-                #             HOVER_THRUST - alt_err * THRUST_KP - vert_vel * THRUST_KD))
-
-                # speed_h  = math.sqrt(vn * vn + ve * ve)
-                # aligned  = abs(yaw_err) < math.radians(30)
-                # near_alt = abs(alt_err) < ALT_LEASH_M
-                # # go       = aligned and near_alt and speed_h < MAX_SPEED_MPS
-                # # if go:
-                # #     pitch_rate = FORWARD_PITCH
-                # # elif not near_alt and speed_h > DECEL_SPEED:
-                # #     pitch_rate = LEVEL_PITCH
-                # # else:
-                # #     pitch_rate = 0.0
-                # # Target speed shrinks as we approach the gate, so the
-
-                # # drone arrives slow enough for yaw correction to actually
-                # # converge before passing through.
-                # if dist < APPROACH_DECEL_RADIUS:
-                #     # Linear ramp from cruise speed down to MIN_APPROACH_SPEED
-                #     # as dist goes from APPROACH_DECEL_RADIUS -> 0.
-                #     frac = dist / APPROACH_DECEL_RADIUS
-                #     target_speed = MIN_APPROACH_SPEED + frac * (guidance.max_speed - MIN_APPROACH_SPEED)
-                # else:
-                #     target_speed = guidance.max_speed   # or guidance._compute_speed(), see below
-
-                # speed_err = speed_h - target_speed
-                # # Positive speed_err (too fast) -> nose up (positive pitch_rate, decelerate)
-                # # Negative speed_err (too slow)  -> nose down (negative pitch_rate, accelerate)
-                # pitch_rate = max(-MAX_PITCH_RATE, min(MAX_PITCH_RATE, speed_err * PITCH_KP))
-
-                # Altitude and yaw thrust/yaw_rate computation unchanged below this point
-
-                # self._send_attitude_target(0.0, pitch_rate, yaw_rate, thrust)
-                # logger.info(
-                #     f"  G{gate['gate_id']}: pos=({n:.1f},{e:.1f},{cur_alt:.1f}m) dist={dist:.1f}m "
-                #     f"yaw={math.degrees(current_yaw):.0f}° yawerr={math.degrees(yaw_err):.0f}° "
-                #     f"spd={speed_h:.1f} vz={vert_vel:.1f} T={thrust:.2f} "
-                    #f"{'fwd' if go else ('lvl' if not near_alt and speed_h > DECEL_SPEED else 'cst')}"
-                # )
-                # --- DIAGNOSTIC: line segment internals at this tick ---
-                # Remove once the yaw-flip bug is confirmed fixed.
-                _chi_line_deg = math.degrees(
-                    math.atan2(guidance._line_dir_e, guidance._line_dir_n)
-                )
-                logger.info(
-                    f"    LINE: seq_idx={guidance.sequencer.index} "
-                    f"origin=({guidance._line_origin_n:.1f},{guidance._line_origin_e:.1f}) "
-                    f"dir=({guidance._line_dir_n:.2f},{guidance._line_dir_e:.2f}) "
-                    f"chi_line={_chi_line_deg:.0f}° "
-                    f"target_yaw={math.degrees(output.target_yaw):.0f}°"
-                )
-                time.sleep(0.05)
-            else:
-                logger.warning("fly_gates: overall timeout reached.")
-
+            self._run_mpc_phase(guidance, timeout_per_gate_s * len(gates_sorted), "RACE")
             self.hold_position()
 
 

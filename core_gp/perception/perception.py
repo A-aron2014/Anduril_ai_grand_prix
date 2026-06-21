@@ -23,10 +23,17 @@ class GateObservation:
     """A detected gate in the image, projected to a bearing + range estimate."""
     pixel_center: Tuple[float, float]   # (u, v) in image
     pixel_width: float                  # apparent width in pixels
-    bearing_body: np.ndarray            # unit vector in body-NED frame
-    range_estimate: float               # metres (from apparent size heuristic)
+    bearing_body: np.ndarray            # unit vector in body-FRD frame (forward, right, down)
+    range_estimate: float               # metres (from apparent size heuristic, or PnP if pose_valid)
     confidence: float                   # 0–1
     gate_id: int = -1                   # assigned by tracker
+
+    # Populated when solvePnP succeeds on a clean 4-corner quad fit; gives
+    # the full relative gate pose instead of just a bearing ray, which is
+    # what guidance actually needs to localize gates from vision alone.
+    pose_valid: bool = False
+    position_body: Optional[np.ndarray] = None   # (fwd, right, down) metres, gate center
+    relative_yaw: float = 0.0                     # gate-plane heading relative to body, radians
 
 
 @dataclass
@@ -69,18 +76,48 @@ class GateDetector:
     TILT_DEG = 20.0                     # camera tilted upward
 
     def __init__(self, gate_real_width_m: float = 2.0,
+                 gate_real_height_m: float = None,
                  min_contour_area: float = 500.0):
         self.gate_real_width_m = gate_real_width_m
+        # Gates are often square in practice; default height to width if
+        # not given separately.
+        self.gate_real_height_m = gate_real_height_m if gate_real_height_m is not None else gate_real_width_m
         self.min_contour_area = min_contour_area
         self._next_id = 0
 
-        # Pre-compute camera→body rotation (inverse of body→cam)
+        # HSV band for "bright orange" — wider than a tight guess since we
+        # have no real footage to calibrate against yet. Hue 0-30 covers
+        # red-orange through orange-yellow (OpenCV hue is 0-179, red=0);
+        # saturation/value floors of 80 are permissive enough to admit a
+        # mildly-lit orange against a desaturated gray background while
+        # still excluding gray (low saturation by definition).
+        self.hsv_lower = np.array([0, 80, 80])
+        self.hsv_upper = np.array([30, 255, 255])
+
+        # Stage-by-stage diagnostics, updated every detect() call, so a
+        # caller can tell *where* detection is failing (no colour match at
+        # all vs. a match that's just too small/non-quad) instead of just
+        # seeing "0 gates" with no further information.
+        self.last_mask_pixel_count = 0
+        self.last_raw_contour_count = 0
+        self.last_area_filtered_count = 0
+        self.last_quad_count = 0
+        self.last_dominant_hsv: Optional[Tuple[float, float, float]] = None
+
+        # Camera (OpenCV: x=right, y=down, z=forward) -> body-FRD
+        # (forward, right, down). This is a permutation (camera axes don't
+        # share the body's axis *order*, only a common origin) composed
+        # with the upward pitch tilt -- NOT just a tilt rotation applied
+        # in place, which would silently mislabel "forward" as "right".
+        # Anchor check: a dead-center pixel (camera ray straight down the
+        # lens, (0,0,1)) must map to a body ray that is mostly forward
+        # with an upward (negative-down) component, since the camera is
+        # tilted nose-up relative to the body.
         tilt = math.radians(self.TILT_DEG)
-        # Camera tilted nose-up: rotate image plane rays back to body NED
         self._R_cam_to_body = np.array([
-            [math.cos(tilt),  0, math.sin(tilt)],
-            [0,               1, 0             ],
-            [-math.sin(tilt), 0, math.cos(tilt)],
+            [0,             math.sin(tilt),  math.cos(tilt)],
+            [1,             0,                0             ],
+            [0,             math.cos(tilt), -math.sin(tilt)],
         ])
 
     # ------------------------------------------------------------------
@@ -93,31 +130,59 @@ class GateDetector:
             logger.error("OpenCV not available")
             return []
 
+        self._update_dominant_hsv_diagnostic(frame, cv2)
+
         contours = self._segment_and_find_contours(frame, cv2)
+        self.last_raw_contour_count = len(contours)
+        self.last_quad_count = 0
+
         gates = []
+        area_filtered = 0
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < self.min_contour_area:
                 continue
+            area_filtered += 1
             obs = self._contour_to_observation(cnt, cv2)
             if obs:
                 gates.append(obs)
+        self.last_area_filtered_count = area_filtered
 
         # Sort by range (closest first)
         gates.sort(key=lambda g: g.range_estimate)
         return gates
 
+    def _update_dominant_hsv_diagnostic(self, frame, cv2):
+        """
+        Reports the dominant colour of non-gray pixels in the frame,
+        independent of the configured hsv_lower/hsv_upper band -- this is
+        what should be used to actually tune that band, instead of
+        guessing. Gray/background pixels (low saturation) are excluded so
+        the result reflects whatever *is* colourful in frame (gate markers,
+        if visible).
+        """
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        sat = hsv[:, :, 1]
+        colourful = sat > 60
+        if not np.any(colourful):
+            self.last_dominant_hsv = None
+            return
+        h = float(np.median(hsv[:, :, 0][colourful]))
+        s = float(np.median(hsv[:, :, 1][colourful]))
+        v = float(np.median(hsv[:, :, 2][colourful]))
+        self.last_dominant_hsv = (h, s, v)
+
     def _segment_and_find_contours(self, frame, cv2):
         """
         HSV segmentation for brightly coloured gate markers.
-        Tune the HSV ranges for the actual gate colours in the sim.
+        Tune hsv_lower/hsv_upper for the actual gate colours in the sim --
+        last_dominant_hsv (set by detect()) reports the actual colourful
+        pixels in frame to calibrate against.
         """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # Example: orange gate markers
-        lower = np.array([5, 150, 150])
-        upper = np.array([25, 255, 255])
-        mask = cv2.inRange(hsv, lower, upper)
+        mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
+        self.last_mask_pixel_count = int(np.count_nonzero(mask))
 
         # Morphological cleanup
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -143,14 +208,28 @@ class GateDetector:
         ])
         ray_cam /= np.linalg.norm(ray_cam)
 
-        # Rotate to body NED
+        # Rotate to body frame (forward, right, down)
         ray_body = self._R_cam_to_body @ ray_cam
         ray_body /= np.linalg.norm(ray_body)
 
-        # Range from apparent width: R = fx * real_width / pixel_width
+        # Range from apparent width — fallback heuristic, overridden below
+        # if a clean 4-corner PnP solve succeeds.
         range_est = self.FX * self.gate_real_width_m / pix_width
-
         confidence = min(1.0, pix_width / 100.0)
+
+        position_body = None
+        relative_yaw = 0.0
+        pose_valid = False
+
+        quad = self._contour_to_quad(contour, cv2)
+        if quad is not None:
+            self.last_quad_count += 1
+            pnp_result = self._solve_pnp(quad, cv2)
+            if pnp_result is not None:
+                position_body, relative_yaw = pnp_result
+                range_est = float(np.linalg.norm(position_body))
+                pose_valid = True
+                confidence = min(1.0, confidence + 0.3)   # PnP solve is a stronger signal than width alone
 
         obs = GateObservation(
             pixel_center=(cx_px, cy_px),
@@ -159,9 +238,93 @@ class GateDetector:
             range_estimate=range_est,
             confidence=confidence,
             gate_id=self._next_id,
+            pose_valid=pose_valid,
+            position_body=position_body,
+            relative_yaw=relative_yaw,
         )
         self._next_id += 1
         return obs
+
+    # ------------------------------------------------------------------
+    # PnP-based relative pose (preferred over the width-heuristic range
+    # estimate whenever the gate's 4 corners can be cleanly extracted)
+    # ------------------------------------------------------------------
+
+    def _contour_to_quad(self, contour, cv2) -> Optional[np.ndarray]:
+        """
+        Approximates the contour to a quadrilateral and returns its 4
+        corners ordered (top-left, top-right, bottom-right, bottom-left)
+        in pixel coordinates, or None if the contour isn't cleanly
+        4-sided (occlusion, blur, segmentation noise, etc.) — callers
+        fall back to the width-heuristic bearing/range estimate.
+        """
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+        if len(approx) != 4:
+            return None
+
+        pts = approx.reshape(4, 2).astype(np.float64)
+        s = pts.sum(axis=1)
+        diff = pts[:, 0] - pts[:, 1]
+        ordered = np.zeros((4, 2), dtype=np.float64)
+        ordered[0] = pts[np.argmin(s)]      # top-left: smallest x+y
+        ordered[2] = pts[np.argmax(s)]      # bottom-right: largest x+y
+        ordered[1] = pts[np.argmax(diff)]   # top-right: largest x-y
+        ordered[3] = pts[np.argmin(diff)]   # bottom-left: smallest x-y
+        return ordered
+
+    def _solve_pnp(self, image_corners: np.ndarray, cv2) -> Optional[Tuple[np.ndarray, float]]:
+        """
+        image_corners: (4,2) pixel coordinates, ordered TL/TR/BR/BL,
+        matching the model points below.
+
+        Returns (position_body, relative_yaw):
+          position_body — gate center relative to the drone, in body-FRD
+                          (forward, right, down) metres.
+          relative_yaw  — gate-plane heading relative to body forward,
+                          radians. 0 = gate faced square-on; nonzero means
+                          approaching the gate at an angle.
+        Returns None if the solve is degenerate or fails.
+        """
+        hw = self.gate_real_width_m / 2.0
+        hh = self.gate_real_height_m / 2.0
+        model_points = np.array([
+            [-hw, -hh, 0.0],   # top-left
+            [ hw, -hh, 0.0],   # top-right
+            [ hw,  hh, 0.0],   # bottom-right
+            [-hw,  hh, 0.0],   # bottom-left
+        ], dtype=np.float64)
+
+        K = np.array([
+            [self.FX, 0,        self.CX],
+            [0,        self.FY, self.CY],
+            [0,        0,        1.0   ],
+        ], dtype=np.float64)
+
+        # IPPE (not IPPE_SQUARE) — gates aren't guaranteed to be square,
+        # width/height are independent fields in the track data, and
+        # IPPE_SQUARE's square assumption gives a silently wrong pose on
+        # a rectangular target.
+        pnp_flag = getattr(cv2, 'SOLVEPNP_IPPE', cv2.SOLVEPNP_ITERATIVE)
+        ok, rvec, tvec = cv2.solvePnP(
+            model_points, image_corners, K, None, flags=pnp_flag
+        )
+        if not ok:
+            return None
+
+        t_cam = tvec.reshape(3)
+        R_gate_to_cam, _ = cv2.Rodrigues(rvec)
+
+        position_body = self._R_cam_to_body @ t_cam
+        R_gate_to_body = self._R_cam_to_body @ R_gate_to_cam
+
+        # Gate plane's own forward axis (its local Z, the direction you'd
+        # fly straight through it) expressed in body coordinates — gives
+        # how square-on the approach is.
+        gate_normal_body = R_gate_to_body[:, 2]
+        relative_yaw = math.atan2(gate_normal_body[1], gate_normal_body[0])
+
+        return position_body, relative_yaw
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.venv/
+core_gp/debug_frames/
+PyAIPilotExample/
