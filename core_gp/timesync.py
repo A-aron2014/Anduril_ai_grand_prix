@@ -4,7 +4,7 @@ import threading
 from pymavlink import mavutil
 
 TIMESYNC_REQUEST_HZ = 10
-HEARTBEAT_HZ        = 1
+HEARTBEAT_HZ        = 2
 
 class TimeSync:
 

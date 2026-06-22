@@ -18,6 +18,7 @@ import guidance.guidance as guidance
 from pymavlink import mavutil
 import numpy as np
 from core.state_estimator import VehicleState
+from control.attitude_autopilot import AttitudeAutopilot
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
@@ -115,16 +116,19 @@ class FlightController:
 
     FORWARD_SPEED   = 0.1   # m/s north during forward flight (used by fly_forward only)
 
-    # Shared by every MPC-driven phase (takeoff, racing) — see _run_mpc_phase.
-    # Position + velocity together. Confirmed empirically: velocity-only
-    # (position ignored) produced *zero* response from the sim — it just
-    # sat there. Position+velocity got a real response (smooth takeoff
-    # climb), but the first attempt sent a position target only an
-    # infinitesimal step from the current position alongside a large
-    # velocity feedforward, which is an internally inconsistent reference
-    # for a position-tracking controller and likely caused the vertical
-    # runaway seen during racing. MPCGuidance now sends a real lead point
-    # (position_lookahead_steps into its own predicted trajectory) instead.
+    # NOTE: SET_POSITION_TARGET_LOCAL_NED is confirmed broken in this sim --
+    # streaming it faster than ~1 message/1-2s causes an unbounded climb to
+    # 150m+ regardless of what's actually commanded (proven across 7
+    # isolated tests: hold_test.py, launch_profile_test.py,
+    # single_shot_test.py, frozen_target_test.py, low_rate_test.py,
+    # rate_threshold_test.py, attitude_target_test.py). SET_ATTITUDE_TARGET
+    # at the same rate behaves like a normal physical system instead
+    # (bounded terminal velocity). _run_mpc_phase and hold_position() now
+    # close the position/velocity -> attitude/thrust loop themselves via
+    # AttitudeAutopilot and drive _send_attitude_target. SEND_TYPE_MASK and
+    # _send_position_target are kept only for the diagnostic test scripts
+    # above that demonstrate the bug -- do not wire them back into the
+    # live flight path.
     SEND_TYPE_MASK = (
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
         mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
@@ -165,6 +169,10 @@ class FlightController:
     def _pitch(self) -> float:
         """Return pitch (rad) from the latest ATTITUDE message."""
         return self.data.get('pitch', 0.0)
+
+    def _roll(self) -> float:
+        """Return roll (rad) from the latest ATTITUDE message."""
+        return self.data.get('roll', 0.0)
 
     def _wait_for_telemetry(self, timeout_s: float = 5.0):
         """Block until shared_data contains at least one position update."""
@@ -256,15 +264,15 @@ class FlightController:
         """
         Drives one MPCGuidance instance to completion. Each tick: read
         telemetry, ask guidance for the next position+velocity reference,
-        forward it straight to the sim's onboard controller. No PID layer
-        here — the sim's autopilot already closes the position/velocity ->
-        attitude/thrust loop, so this is the same actuation path for every
-        phase (takeoff, racing) instead of each phase hand-rolling its own
-        thrust formula.
+        then run it through AttitudeAutopilot (our own position/velocity ->
+        attitude/thrust loop) and send the result via _send_attitude_target.
+        SET_POSITION_TARGET_LOCAL_NED is not used here -- see the note on
+        SEND_TYPE_MASK above for why.
 
         Returns True if the phase's guidance reported course_complete,
         False if it timed out.
         """
+        attitude_autopilot = AttitudeAutopilot()
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             n, e, cur_d = self._pos()
@@ -272,7 +280,7 @@ class FlightController:
             state = VehicleState(
                 north=n, east=e, down=cur_d,
                 vn=vn, ve=ve, vd=vd,
-                yaw=self._yaw(),
+                roll=self._roll(), pitch=self._pitch(), yaw=self._yaw(),
             )
 
             output = guidance.compute(state=state, gates=[], obstacles=[])
@@ -280,23 +288,14 @@ class FlightController:
             if output.course_complete:
                 logger.info(f"{phase_label}: complete ({guidance.status_string()}).")
                 # Send an explicit hold immediately instead of just returning —
-                # otherwise the autopilot keeps tracking whatever the *last*
-                # in-flight command was (e.g. a climb) for however long it
-                # takes the next phase to construct its guidance and send its
-                # first command, which showed up as a multi-m/s velocity jump
-                # at the takeoff->race transition.
+                # otherwise the vehicle keeps whatever rate/thrust was last
+                # commanded for however long it takes the next phase to
+                # construct its guidance and send its first command.
                 self.hold_position()
                 return True
 
-            self._send_position_target(
-                type_mask=self.SEND_TYPE_MASK,
-                x=output.target_position[0],
-                y=output.target_position[1],
-                z=output.target_position[2],
-                vx=output.target_velocity[0],
-                vy=output.target_velocity[1],
-                vz=output.target_velocity[2],
-            )
+            roll_rate, pitch_rate, yaw_rate, thrust = attitude_autopilot.compute(state, output)
+            self._send_attitude_target(roll_rate, pitch_rate, yaw_rate, thrust)
 
             logger.info(
                 f"[{phase_label}] POS=({n:.1f},{e:.1f},{cur_d:.1f}) "
@@ -307,7 +306,10 @@ class FlightController:
                 f"{output.target_position[1]:.1f},"
                 f"{output.target_position[2]:.1f}) "
                 f"ACTUAL_VEL=({vn:.1f},{ve:.1f},{vd:.1f}) "
-                f"YAW={math.degrees(output.target_yaw):.1f} "
+                f"ATT=(roll={state.roll:.2f},pitch={state.pitch:.2f},yaw={state.yaw:.2f}) "
+                f"ATT_CMD=(roll_rate={roll_rate:.2f},pitch_rate={pitch_rate:.2f},"
+                f"yaw_rate={yaw_rate:.2f},thrust={thrust:.2f}) "
+                f"YAW_TARGET={math.degrees(output.target_yaw):.1f} "
                 f"MPC: {guidance.status_string()}"
             )
             time.sleep(0.05)
@@ -372,15 +374,41 @@ class FlightController:
         logger.info("Forward flight complete — holding position.")
         self.hold_position()
 
-    def hold_position(self):
-        n, e, d = self._pos()
-        type_mask = (
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE |
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
+    def hold_position(self, duration_s: float = 0.5):
+        """
+        Actively holds the position measured at call time by streaming
+        attitude/thrust commands through a fresh AttitudeAutopilot for
+        duration_s. Unlike the old position-target version, this is not
+        fire-and-forget: there is no sim-side controller persisting our
+        last setpoint, so holding only happens for as long as this loop
+        keeps running. Callers that need to stay put longer than
+        duration_s must keep calling this (or start the next phase, which
+        streams continuously on its own).
+        """
+        hold_n, hold_e, hold_d = self._pos()
+        hold_output = guidance.GuidanceOutput(
+            target_position=np.array([hold_n, hold_e, hold_d]),
+            target_velocity=np.zeros(3),
+            target_yaw=self._yaw(),
         )
-        for _ in range(10):
-            self._send_position_target(type_mask, n, e, d, 0.0, 0.0, 0.0)
+        attitude_autopilot = AttitudeAutopilot()
+        deadline = time.monotonic() + duration_s
+        while time.monotonic() < deadline:
+            n, e, d = self._pos()
+            vn, ve, vd = self._vel()
+            state = VehicleState(
+                north=n, east=e, down=d,
+                vn=vn, ve=ve, vd=vd,
+                roll=self._roll(), pitch=self._pitch(), yaw=self._yaw(),
+            )
+            roll_rate, pitch_rate, yaw_rate, thrust = attitude_autopilot.compute(state, hold_output)
+            self._send_attitude_target(roll_rate, pitch_rate, yaw_rate, thrust)
+            logger.info(
+                f"HOLD: pos=({n:.2f},{e:.2f},{d:.2f}) vel=({vn:.2f},{ve:.2f},{vd:.2f}) "
+                f"att=(roll={state.roll:.3f},pitch={state.pitch:.3f},yaw={state.yaw:.3f}) "
+                f"ATT_CMD=(roll_rate={roll_rate:.2f},pitch_rate={pitch_rate:.2f},"
+                f"yaw_rate={yaw_rate:.2f},thrust={thrust:.2f})"
+            )
             time.sleep(0.05)
 
 
@@ -388,11 +416,10 @@ class FlightController:
             """
             Navigate the full gate sequence. MPCGuidance owns trajectory
             generation (a continuous reference across the whole course, not
-            a fresh line segment per gate); _run_mpc_phase forwards its
-            position+velocity reference straight to the sim's onboard
-            controller. No PID layer here — the sim's autopilot already
-            closes the position/velocity -> attitude/thrust loop, so adding
-            a second feedback loop on top of guidance would just fight it.
+            a fresh line segment per gate); _run_mpc_phase runs that
+            reference through AttitudeAutopilot and drives the vehicle via
+            SET_ATTITUDE_TARGET, since SET_POSITION_TARGET_LOCAL_NED is
+            confirmed broken in this sim (see the note on SEND_TYPE_MASK).
             """
             from guidance.mpc_guidance import MPCGuidance
             from guidance.guidance import CourseMap

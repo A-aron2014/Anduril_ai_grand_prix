@@ -129,7 +129,7 @@ class MAVLinkRX:
         self.data['base_mode']     = msg.base_mode
         self.data['custom_mode']   = msg.custom_mode
         self.data['system_status'] = msg.system_status
-    time.sleep(2.0)
+
     def on_timesync(self, msg):
         request_time = msg.ts1
         response_time = msg.tc1

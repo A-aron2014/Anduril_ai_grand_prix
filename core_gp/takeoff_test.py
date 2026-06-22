@@ -1,17 +1,18 @@
 """
-Regression test for the new attitude-based hold: arm, then call
-FlightController.hold_position() for an extended duration and log
-telemetry throughout.
+Regression test for takeoff_mpc(): arm, climb to a target altitude via
+the MPC + AttitudeAutopilot path, then hold and log telemetry throughout
+the climb and the post-climb hold so a real altitude/position overshoot
+or drift is visible, not just "did it finish."
 
-Superseded the original premise of this script (an isolated
-SET_POSITION_TARGET_LOCAL_NED hold test) -- that channel is confirmed
-broken in this sim (see launch_profile_test.py, frozen_target_test.py,
-rate_threshold_test.py, attitude_target_test.py for the evidence trail).
-Flight control now drives SET_ATTITUDE_TARGET via AttitudeAutopilot
-instead; this script checks that hold_position() actually keeps the
-vehicle near its arm position rather than drifting/climbing.
+This is the first real test of takeoff_mpc() since the AttitudeAutopilot
+sign-convention fixes (see project_attitude_axis_sign_conventions memory) --
+takeoff_mpc/_run_mpc_phase share the exact same actuation path hold_test.py
+already validated, but this is a moving target (climbing to climb_alt_m)
+rather than a static hold, and a fresh AttitudeAutopilot/MPCGuidance
+instance, so it's worth checking in isolation before chaining into
+fly_gates().
 
-Run directly: python hold_test.py
+Run directly: python takeoff_test.py
 """
 
 import time
@@ -50,13 +51,23 @@ def main():
         logger.info(f"Post-arm position (should be ~ground level): ({n:.2f},{e:.2f},{d:.2f})")
         logger.info(f"Post-arm attitude (should be ~level): roll={roll:.3f} pitch={pitch:.3f} yaw={yaw:.3f}")
 
-        logger.info("Holding via AttitudeAutopilot (SET_ATTITUDE_TARGET) for 10s.")
-        fc.hold_position(duration_s=10.0)
+        logger.info("Climbing to 0.5m AGL via takeoff_mpc()...")
+        fc.takeoff_mpc(climb_alt_m=0.5, timeout_s=15.0)
 
         n, e, d = fc._pos()
         vn, ve, vd = fc._vel()
         logger.info(
-            f"Hold test complete. Final pos=({n:.2f},{e:.2f},{d:.2f}) "
+            f"Post-takeoff: pos=({n:.2f},{e:.2f},{d:.2f}) alt={-d:.2f}m "
+            f"vel=({vn:.2f},{ve:.2f},{vd:.2f})"
+        )
+
+        logger.info("Holding for 5s to check post-climb stability...")
+        fc.hold_position(duration_s=5.0)
+
+        n, e, d = fc._pos()
+        vn, ve, vd = fc._vel()
+        logger.info(
+            f"Takeoff test complete. Final pos=({n:.2f},{e:.2f},{d:.2f}) alt={-d:.2f}m "
             f"vel=({vn:.2f},{ve:.2f},{vd:.2f})"
         )
 
@@ -65,10 +76,6 @@ def main():
         fc.hold_position()
 
     finally:
-        # Without this, MAVLinkRX/TimeSync's non-daemon threads keep the
-        # process alive after Ctrl-C, which keeps VisionStreamReceiver's
-        # daemon threads alive too -- that's why VISION logs kept printing
-        # after a cancelled run.
         for component in (ts_loop, mavlink_rx, vision_rx):
             try:
                 t = component.get_thread_for_join()
