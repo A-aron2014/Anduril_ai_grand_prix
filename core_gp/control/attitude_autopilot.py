@@ -57,15 +57,57 @@ class AttitudeAutopilotConfig:
     # No D-term: it amplifies telemetry jitter into the next loop down
     # without any filtering, which was a likely contributor to the
     # chattering seen in the first (pre-sign-fix) hold_test.py run.
+    # tilt_ki was 0.0 -- a P-only loop can't cancel a steady-state velocity
+    # bias at all, which is exactly what was observed: HOLD's horizontal
+    # speed crept monotonically from 0.7 to 1.2+ m/s over a 3s window and
+    # never converged. 0.03 wasn't enough either -- speed still hit 4+ m/s
+    # within the 3s settle window (2026-06-25 runs), consistent with a
+    # real, fairly large steady-state bias (cf. the "~0.3rad spawn-tilt
+    # offset" noted below -- double max_tilt) that a weak integral takes
+    # too long to walk out. Raised further; if HOLD still won't settle
+    # after this, max_tilt=0.15 -- not the gain -- is the likely ceiling,
+    # since the output saturates there well before the bias is cancelled.
+    #
+    # Confirmed (2026-06-25 race log): max_tilt=0.15 IS the ceiling, not
+    # just for HOLD but for RACE too. At hover_thrust=0.27, the max
+    # horizontal thrust component available at 0.15rad saturation is only
+    # thrust*sin(0.15) =~ 0.04 (=~1.4 m/s2 of forward accel) -- nowhere
+    # near enough to reach or hold an 8 m/s cruise reference against drag.
+    # U0_RAW stayed correctly signed and grew monotonically (-19.9 to
+    # -32.5+ m/s2) the entire leg while pitch correctly drove nose-down,
+    # yet ACTUAL_VEL decayed through zero and reversed -- the commanded
+    # direction was right the whole time, the vehicle just never had
+    # enough lean authority to act on it once residual momentum bled off.
+    # Raised to a value in line with typical racing-drone lean angles.
     tilt_kp: float = 0.02
-    tilt_ki: float = 0.0
+    tilt_ki: float = 0.07
     tilt_kd: float = 0.0
-    max_tilt: float = 0.15          # rad (~8.5 deg) -- gentle for a hold
+    max_tilt: float = 0.5           # rad (~28.6 deg)
 
-    thrust_kp: float = 0.03
-    thrust_ki: float = 0.02         # self-trims hover_thrust if it's off
+    # Were 0.03/0.02 -- too gentle to kill a multi-m/s vertical velocity
+    # error quickly: observed taking 5+ seconds and >20m of altitude
+    # excursion to walk thrust down and arrest a ~3 m/s residual climb
+    # carried over from a hold phase. kp=0.12 reaches max_thrust_delta on
+    # an error of ~2.5 m/s in a single tick instead of crawling toward it.
+    thrust_kp: float = 0.12
+    thrust_ki: float = 0.05         # self-trims hover_thrust if it's off
     thrust_kd: float = 0.0
-    hover_thrust: float = 0.4       # starting guess, see fly_forward()
+    # Was 0.4 -- a starting guess that turned out ~0.13 too high. Every
+    # HOLD phase across many logs settles vertical velocity near zero with
+    # thrust around 0.26-0.28, never near 0.4. Because a fresh
+    # AttitudeAutopilot (integral=0) is constructed at the start of every
+    # flight phase, and the velocity error right at a phase boundary is
+    # usually near zero (masking the bias from the PID), thrust starts
+    # AT hover_thrust with no correction applied yet -- so a too-high
+    # default meant every single phase transition (TAKEOFF->HOLD->RACE,
+    # or into this test) started with ~0.13 of unwanted excess lift and
+    # climbed for several seconds before the slow integral term walked it
+    # back down. This was misread as a pitch-coupling effect (pitch is
+    # also elevated right after a phase transition, but it's correlation,
+    # not cause -- a flat leg with zero pitch authority would show this
+    # same thrust-too-high climb at the start of every phase too, since
+    # the discrepancy is in this constant, not in any attitude coupling).
+    hover_thrust: float = 0.27
     max_thrust_delta: float = 0.3
     min_thrust: float = 0.05
     max_thrust: float = 0.9
@@ -145,16 +187,27 @@ class AttitudeAutopilot:
         forward_err = vel_err_n * cy + vel_err_e * sy
         right_err = -vel_err_n * sy + vel_err_e * cy
 
-        # Forward error needs nose-down (negative pitch) to accelerate
-        # forward -- matches fly_forward()'s FORWARD_PITCH convention.
-        # Right error mirrors it: positive roll (right-side-down) tilts
-        # thrust LEFT, so accelerating rightward needs NEGATIVE roll --
-        # the same negation as pitch, just on the other axis. Missing this
+        # Right error: positive roll (right-side-down) tilts thrust LEFT,
+        # so accelerating rightward needs NEGATIVE roll. Missing this
         # negation was confirmed (2026-06-21 hold_test.py run) to cause
         # positive feedback: the vehicle drifted essentially monotonically
         # to +103m east over 10s while roll_rate sat saturated at -2.0,
         # i.e. the correction was being applied in the wrong direction.
-        pitch_des = -self._pid_forward.update(forward_err, now)
+        #
+        # Pitch previously carried the same negation "to match
+        # fly_forward()'s FORWARD_PITCH convention" -- an old script,
+        # never independently re-verified against this attitude-rate
+        # cascade the way roll's negation was. Confirmed wrong
+        # (2026-06-25 race log): pitch correctly tracked an increasingly
+        # nose-down pitch_des the whole leg (the rest of the cascade was
+        # doing exactly what it intended), yet ACTUAL_VEL's north
+        # component decayed toward zero in lockstep with |pitch| growing
+        # instead of accelerating toward the gate, while U0_RAW stayed
+        # strongly, correctly signed throughout -- the vehicle was
+        # decelerating in proportion to its own forward-intended tilt,
+        # not just under-accelerating against drag (which would plateau,
+        # not decay through zero from a near-stop). Removed the negation.
+        pitch_des = self._pid_forward.update(forward_err, now)
         roll_des = -self._pid_right.update(right_err, now)
 
         # --- Vertical velocity error -> thrust delta around hover ---

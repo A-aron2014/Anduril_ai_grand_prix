@@ -95,7 +95,7 @@ def main():
             payload = payload[38:]
             gates.append({
                 "gate_id": gate_id,
-                "north": pos_n, "east": pos_e+0.5, "down": -pos_d + 1.5,
+                "north": pos_n, "east": pos_e, "down": pos_d,
                 "orient": (ow, ox, oy, oz),
                 "width": width, "height": height,
             })

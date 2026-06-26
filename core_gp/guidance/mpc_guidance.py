@@ -52,19 +52,41 @@ class MPCConfig:
     dt: float = 0.05          # control tick, matches the ~20 Hz fly_gates loop
     horizon: int = 16         # ~0.8 s lookahead
 
-    # State tracking weights (position, velocity)
+    # State tracking weights (position, velocity). q_vel was 0.5 -- so cheap
+    # relative to q_pos that the solve preferred to smooth a velocity error
+    # out over the whole horizon rather than spend control effort canceling
+    # it quickly (observed: a multi-m/s residual climb taking 5+ seconds and
+    # >20m to arrest). Raising it makes the tracker treat "moving at the
+    # wrong speed" as costly as "being in the wrong place" rather than a
+    # distant second priority.
     q_pos: float = 6.0
-    q_vel: float = 0.5
-    q_pos_terminal: float = 14.0
-    q_vel_terminal: float = 2.0
+    q_vel: float = 2.5
+    q_pos_terminal: float = 8.0
+    q_vel_terminal: float = 5.0
 
-    # Control effort weight (acceleration)
-    r_acc: float = 0.08
+    # Control effort weight (acceleration). Was 0.08 -- too cheap relative
+    # to q_pos, which let the solve happily slam into the velocity clamps
+    # (observed: vertical channel pinned at max_vert_speed for >1s while
+    # overshooting the leg's altitude target by ~10m) instead of trading
+    # off a slower, smoother approach.
+    r_acc: float = 0.2
 
-    # Output limits -- enforced by clamping, not by the QP
+    # Output limits -- enforced by clamping, not by the QP. max_accel is
+    # split into horizontal/vertical clips (thrust and tilt are separate
+    # actuators -- the vehicle doesn't have one shared acceleration budget
+    # across axes the way a single combined-vector clip implies). A single
+    # combined clip was confirmed (U0_RAW diagnostic, 2026-06-25) to starve
+    # the vertical channel for seconds at the start of every race leg: the
+    # 0->8m/s horizontal speed-up dominates the vector norm (-19 to -20 m/s2
+    # raw) and forces the same scale-down onto the vertical component even
+    # while it's legitimately growing (the solve correctly wanted more and
+    # more vertical correction, +3.9 up to +66.7, while clipping squeezed
+    # the applied value down to near nothing) -- altitude drifted
+    # uncontrolled for 3-5s every leg start as a direct result.
     max_horiz_speed: float = 14.0
     max_vert_speed: float = 5.0
-    max_accel: float = 8.0
+    max_accel_horiz: float = 8.0
+    max_accel_vert: float = 8.0
 
     # How many ticks ahead (of the MPC's own predicted trajectory) to pull
     # the position target from, so it's a real lead point consistent with
@@ -121,19 +143,33 @@ class GatePath:
             else:
                 self.seg_speed[i] = max(min_speed, cruise_speed * 0.4)
 
-    def project(self, pos) -> float:
-        """Arc length of the closest point on the polyline to `pos`."""
+    def project(self, pos):
+        """
+        Arc length of the closest point on the polyline to `pos`, plus
+        diagnostics: lateral_dist is the perpendicular distance from pos to
+        that closest point (how far off the line we are), and raw_t is the
+        *unclamped* scalar projection onto the winning segment -- project()
+        itself clips this to [0, length] to pick the closest point, which
+        silently freezes progress at a segment's start whenever the drone
+        has overshot off the front of it (raw_t < 0, e.g. climbing/descending
+        away from the line faster than it advances along it). Comparing
+        raw_t to the clamped value exposes that case instead of hiding it.
+        """
         pos = np.asarray(pos, dtype=float)
-        best_s, best_d2 = 0.0, np.inf
+        best_s, best_d2, best_raw_t, best_idx = 0.0, np.inf, 0.0, 0
         for i in range(len(self.seg_dir)):
             p0, d, length = self.points[i], self.seg_dir[i], self.seg_len[i]
-            t = float(np.clip(np.dot(pos - p0, d), 0.0, length))
+            raw_t = float(np.dot(pos - p0, d))
+            t = float(np.clip(raw_t, 0.0, length))
             closest = p0 + d * t
             d2 = float(np.sum((pos - closest) ** 2))
             if d2 < best_d2:
                 best_d2 = d2
                 best_s = self.cum_len[i] + t
-        return best_s
+                best_raw_t = raw_t
+                best_idx = i
+        lateral_dist = math.sqrt(best_d2)
+        return best_s, lateral_dist, best_raw_t, best_idx
 
     def sample(self, s: float):
         """Position, tangent direction, and scheduled speed at arc length s."""
@@ -244,6 +280,13 @@ class MPCGuidance:
         )
         self._last_ref_pos = None
         self._last_ref_vel = None
+        self._last_lateral_dist = 0.0
+        self._last_raw_t = 0.0
+        self._last_proj_idx = 0
+        self._last_u0_raw = np.zeros(3)
+        self._last_accel_mag = 0.0
+        self._last_horiz_clipped = False
+        self._last_vert_clipped = False
 
     # ------------------------------------------------------------------
 
@@ -294,11 +337,34 @@ class MPCGuidance:
                 f" on_line_now=({rp[0]:.1f},{rp[1]:.1f},{rp[2]:.1f}) "
                 f"line_vel=({rv[0]:.1f},{rv[1]:.1f},{rv[2]:.1f})"
             )
+        # raw_t < 0 means we've overshot off the *front* of the current
+        # segment (e.g. climbing/descending away from the line faster than
+        # we advance along it) -- project() clamps that to 0, which is why
+        # course_progress can sit frozen even while the drone is clearly
+        # moving. lateral_dist is the straight-line distance off the path
+        # itself, independent of arc-length bookkeeping -- the direct
+        # "how far from where we want to be" number to compare against POS.
+        dev_str = (
+            f" LATERAL_DEV={self._last_lateral_dist:.1f}m"
+            f" RAW_T={self._last_raw_t:+.1f}m(leg{self._last_proj_idx + 1})"
+        )
+        # u0_raw is the LQ solve's actual chosen acceleration *before*
+        # clipping -- compare its sign against line_vel above to tell a
+        # real wrong-direction solve apart from a clipping artifact.
+        # Horizontal/vertical clip flags are reported separately since
+        # they're now applied independently (see max_accel_horiz/vert).
+        u0 = self._last_u0_raw
+        accel_str = (
+            f" U0_RAW=({u0[0]:+.1f},{u0[1]:+.1f},{u0[2]:+.1f}) "
+            f"ACCEL_MAG={self._last_accel_mag:.1f}m/s2"
+            f"{'(H-CLIP)' if self._last_horiz_clipped else ''}"
+            f"{'(V-CLIP)' if self._last_vert_clipped else ''}"
+        )
         return (
             f"leg={idx + 1}/{n_legs} dist_to_next_wp={dist_to_next_wp:.1f}m "
             f"next_wp=({next_wp[0]:.1f},{next_wp[1]:.1f},{next_wp[2]:.1f}) "
             f"course_progress={self.progress_s:.1f}/{self.path.total_len:.1f}m"
-            f"{ref_str}"
+            f"{ref_str}{dev_str}{accel_str}"
         )
 
     def _reference_horizon(self) -> np.ndarray:
@@ -343,7 +409,10 @@ class MPCGuidance:
             self._build_path(position)
             self._last_leg_idx = 0
 
-        raw_s = self.path.project(position)
+        raw_s, lateral_dist, raw_t, proj_idx = self.path.project(position)
+        self._last_lateral_dist = lateral_dist
+        self._last_raw_t = raw_t
+        self._last_proj_idx = proj_idx
         # Monotonic progress: never snap backwards onto an earlier part of
         # the polyline (can happen near sharp turns where two segments pass
         # close to each other) -- only allow tiny jitter, not a real regression.
@@ -383,11 +452,32 @@ class MPCGuidance:
                        state.vn, state.ve, state.vd])
 
         U = self.mpc.solve(x0, x_ref)
-        u0 = U[:3]
+        u0_raw = U[:3].copy()
 
-        accel_mag = float(np.linalg.norm(u0))
-        if accel_mag > cfg.max_accel:
-            u0 = u0 * (cfg.max_accel / accel_mag)
+        # Diagnostics: the *unclipped* optimal acceleration the LQ solve
+        # actually wants. If u0_raw's vertical component disagrees in sign
+        # with the mild feedforward in line_vel/_last_ref_vel, that's the
+        # solve itself choosing the wrong direction -- not a downstream
+        # clipping or sign-convention artifact.
+        self._last_u0_raw = u0_raw.copy()
+        self._last_accel_mag = float(np.linalg.norm(u0_raw))
+
+        # Clip horizontal and vertical acceleration independently --
+        # thrust and tilt are separate actuators, not one shared budget.
+        # A single combined-vector clip here previously meant a large
+        # horizontal speed-up (e.g. ramping to cruise at the start of a
+        # leg, regularly -19..-20 m/s2 raw) consumed nearly the entire
+        # clip allowance and squeezed the vertical component down to near
+        # zero even while it was legitimately large and growing, leaving
+        # altitude to drift uncontrolled for seconds at every leg start.
+        u0 = u0_raw.copy()
+        horiz_mag = float(np.linalg.norm(u0[:2]))
+        self._last_horiz_clipped = horiz_mag > cfg.max_accel_horiz
+        if self._last_horiz_clipped:
+            u0[:2] *= cfg.max_accel_horiz / horiz_mag
+        self._last_vert_clipped = abs(u0[2]) > cfg.max_accel_vert
+        if self._last_vert_clipped:
+            u0[2] = math.copysign(cfg.max_accel_vert, u0[2])
 
         x1 = self.mpc.A @ x0 + self.mpc.B @ u0
 
@@ -411,9 +501,19 @@ class MPCGuidance:
         x_pred = self.mpc.predict(x0, U)
         target_position = x_pred[lookahead_idx, 0:3]
 
+        # Heading from the path's own tangent direction at the current
+        # progress point (x_ref[0, 3:6], already computed above as
+        # _last_ref_vel), not the one-step MPC velocity command. The
+        # latter goes near-zero -- and atan2 of a near-zero vector is
+        # noise-dominated -- whenever the solve is spending its effort on
+        # a vertical correction instead of horizontal motion, which was
+        # causing target_yaw to flip across nearly the full +-180 deg
+        # range tick to tick. The path tangent is leg-constant and stable
+        # by comparison.
+        ref_vel = x_ref[0, 3:6]
         target_yaw = (
-            math.atan2(target_velocity[1], target_velocity[0])
-            if np.linalg.norm(target_velocity[:2]) > 0.3
+            math.atan2(ref_vel[1], ref_vel[0])
+            if np.linalg.norm(ref_vel[:2]) > 0.3
             else state.yaw
         )
 

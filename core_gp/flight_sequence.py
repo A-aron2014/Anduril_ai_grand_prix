@@ -374,16 +374,22 @@ class FlightController:
         logger.info("Forward flight complete — holding position.")
         self.hold_position()
 
-    def hold_position(self, duration_s: float = 0.5):
+    def hold_position(self, duration_s: float = 0.5, settle_speed_mps: float = 0.3,
+                       max_settle_s: float = 3.0):
         """
         Actively holds the position measured at call time by streaming
-        attitude/thrust commands through a fresh AttitudeAutopilot for
-        duration_s. Unlike the old position-target version, this is not
-        fire-and-forget: there is no sim-side controller persisting our
-        last setpoint, so holding only happens for as long as this loop
-        keeps running. Callers that need to stay put longer than
-        duration_s must keep calling this (or start the next phase, which
-        streams continuously on its own).
+        attitude/thrust commands through a fresh AttitudeAutopilot.
+        Unlike the old position-target version, this is not fire-and-forget:
+        there is no sim-side controller persisting our last setpoint, so
+        holding only happens for as long as this loop keeps running.
+
+        Runs for at least duration_s, then keeps going until speed drops
+        below settle_speed_mps (bounded by max_settle_s) -- a fixed 0.5s
+        was letting callers (e.g. fly_gates building its path) start the
+        next phase with several m/s of residual velocity still on the
+        vehicle (observed: a ~3 m/s carried-over climb that took the next
+        phase 5+ seconds and >20m of altitude to fight back under control),
+        which is the caller's problem to inherit, not this loop's to ignore.
         """
         hold_n, hold_e, hold_d = self._pos()
         hold_output = guidance.GuidanceOutput(
@@ -392,8 +398,9 @@ class FlightController:
             target_yaw=self._yaw(),
         )
         attitude_autopilot = AttitudeAutopilot()
-        deadline = time.monotonic() + duration_s
-        while time.monotonic() < deadline:
+        min_deadline = time.monotonic() + duration_s
+        max_deadline = time.monotonic() + max_settle_s
+        while time.monotonic() < max_deadline:
             n, e, d = self._pos()
             vn, ve, vd = self._vel()
             state = VehicleState(
@@ -403,13 +410,21 @@ class FlightController:
             )
             roll_rate, pitch_rate, yaw_rate, thrust = attitude_autopilot.compute(state, hold_output)
             self._send_attitude_target(roll_rate, pitch_rate, yaw_rate, thrust)
+            speed = math.sqrt(vn * vn + ve * ve + vd * vd)
             logger.info(
-                f"HOLD: pos=({n:.2f},{e:.2f},{d:.2f}) vel=({vn:.2f},{ve:.2f},{vd:.2f}) "
+                f"HOLD: pos=({n:.2f},{e:.2f},{d:.2f}) vel=({vn:.2f},{ve:.2f},{vd:.2f}) speed={speed:.2f} "
                 f"att=(roll={state.roll:.3f},pitch={state.pitch:.3f},yaw={state.yaw:.3f}) "
                 f"ATT_CMD=(roll_rate={roll_rate:.2f},pitch_rate={pitch_rate:.2f},"
                 f"yaw_rate={yaw_rate:.2f},thrust={thrust:.2f})"
             )
+            now = time.monotonic()
+            if now >= min_deadline and speed < settle_speed_mps:
+                return
             time.sleep(0.05)
+        logger.warning(
+            f"hold_position: speed still {speed:.2f} m/s after {max_settle_s}s settle "
+            f"window -- proceeding anyway."
+        )
 
 
     def fly_gates(self, gate_store: 'GateStore', timeout_per_gate_s: float = 30.0):
