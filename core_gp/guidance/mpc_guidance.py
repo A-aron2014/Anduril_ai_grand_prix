@@ -59,17 +59,23 @@ class MPCConfig:
     # >20m to arrest). Raising it makes the tracker treat "moving at the
     # wrong speed" as costly as "being in the wrong place" rather than a
     # distant second priority.
-    q_pos: float = 6.0
-    q_vel: float = 2.5
-    q_pos_terminal: float = 8.0
-    q_vel_terminal: float = 5.0
+    # Raised from 6.0/2.5/8.0/5.0 -- those values tracked cleanly but
+    # conservatively. r_acc dropped in the same ratio so the solve is still
+    # willing to spend the extra control effort these imply rather than
+    # smoothing the error out over a longer stretch of the horizon.
+    q_pos: float = 9.0
+    q_vel: float = 3.5
+    q_pos_terminal: float = 12.0
+    q_vel_terminal: float = 7.0
 
     # Control effort weight (acceleration). Was 0.08 -- too cheap relative
     # to q_pos, which let the solve happily slam into the velocity clamps
     # (observed: vertical channel pinned at max_vert_speed for >1s while
     # overshooting the leg's altitude target by ~10m) instead of trading
-    # off a slower, smoother approach.
-    r_acc: float = 0.2
+    # off a slower, smoother approach. 0.2 fixed that; dropped to 0.14 now
+    # that q_pos/q_vel are higher too, to keep the same relative cost ratio
+    # rather than fighting the raised tracking weights back down.
+    r_acc: float = 0.14
 
     # Output limits -- enforced by clamping, not by the QP. max_accel is
     # split into horizontal/vertical clips (thrust and tilt are separate
@@ -82,11 +88,14 @@ class MPCConfig:
     # while it's legitimately growing (the solve correctly wanted more and
     # more vertical correction, +3.9 up to +66.7, while clipping squeezed
     # the applied value down to near nothing) -- altitude drifted
-    # uncontrolled for 3-5s every leg start as a direct result.
-    max_horiz_speed: float = 14.0
-    max_vert_speed: float = 5.0
-    max_accel_horiz: float = 8.0
-    max_accel_vert: float = 8.0
+    # uncontrolled for 3-5s every leg start as a direct result. Limits
+    # raised from 14/5/8/8 now that the per-axis split makes that safe to
+    # do without reintroducing the starvation bug -- each axis still has
+    # its own independent budget, just a bigger one.
+    max_horiz_speed: float = 17.0
+    max_vert_speed: float = 6.5
+    max_accel_horiz: float = 10.5
+    max_accel_vert: float = 10.0
 
     # How many ticks ahead (of the MPC's own predicted trajectory) to pull
     # the position target from, so it's a real lead point consistent with
@@ -101,6 +110,20 @@ class MPCConfig:
     # Obstacle avoidance (soft bias on the reference, not a hard constraint)
     obstacle_radius: float = 3.0
     obstacle_gain: float = 6.0
+
+    # Camera gate-centroid feedback: nudges the reference trajectory toward
+    # the vision-derived (PnP) gate position instead of trusting the sim's
+    # gate telemetry blindly for the whole horizon. gate_vision_gain is a
+    # blend factor, not a full override -- 1.0 would replace the path's own
+    # waypoint with the vision estimate outright, which we don't want given
+    # vision is noisier frame-to-frame than the ground-truth course geometry.
+    # gate_vision_match_radius rejects observations that aren't plausibly
+    # *this* leg's gate (e.g. a different gate visible in frame, or a bad
+    # PnP solve) by requiring the detection be within this distance of the
+    # waypoint we're already heading toward.
+    gate_vision_gain: float = 0.5
+    gate_vision_match_radius: float = 4.0
+    gate_vision_min_confidence: float = 0.4
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +422,34 @@ class MPCGuidance:
         x_ref[:, 0:3] += bias[None, :] * decay[:, None]
         return x_ref
 
+    def _gate_vision_bias(self, x_ref: np.ndarray, leg_idx: int, gates) -> np.ndarray:
+        """
+        gates: list of {'position_ned': np.ndarray, 'confidence': float}
+        observations (already transformed from the camera's body-frame PnP
+        pose into NED by the caller). Unlike _obstacle_bias, this doesn't
+        decay across the horizon -- the gate is a fixed point, not a threat
+        only known "right now", so the whole reference trajectory should
+        bend toward the corrected estimate, not just the next instant.
+        """
+        if not gates:
+            return x_ref
+        cfg = self.cfg
+        best = max(gates, key=lambda g: g.get('confidence', 0.0))
+        if best.get('confidence', 0.0) < cfg.gate_vision_min_confidence:
+            return x_ref
+
+        target_wp = self.path.points[min(leg_idx + 1, len(self.path.points) - 1)]
+        obs_pos = np.asarray(best['position_ned'], dtype=float)
+        err = obs_pos - target_wp
+        if np.linalg.norm(err) > cfg.gate_vision_match_radius:
+            # Not plausibly the gate we're already heading toward (a
+            # different gate in frame, or a noisy/bad PnP solve) -- ignore
+            # rather than yank the path toward an unrelated point.
+            return x_ref
+
+        x_ref[:, 0:3] += err[None, :] * cfg.gate_vision_gain
+        return x_ref
+
     # ------------------------------------------------------------------
 
     def compute(self, state, gates, obstacles) -> GuidanceOutput:
@@ -441,6 +492,7 @@ class MPCGuidance:
 
         x_ref = self._reference_horizon()
         x_ref = self._obstacle_bias(x_ref, state, obstacles)
+        x_ref = self._gate_vision_bias(x_ref, leg_idx, gates)
 
         # The point on the line being tracked *right now* (first horizon
         # step) -- exposed via status_string() so logging can show it's a

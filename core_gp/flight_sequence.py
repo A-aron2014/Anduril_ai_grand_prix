@@ -283,7 +283,23 @@ class FlightController:
                 roll=self._roll(), pitch=self._pitch(), yaw=self._yaw(),
             )
 
-            output = guidance.compute(state=state, gates=[], obstacles=[])
+            # position_body is populated for every confident detection now,
+            # not just ones where the 4-corner PnP solve succeeded (see
+            # perception.py) -- the width/bearing fallback is lower
+            # fidelity but still real signal, and gating on pose_valid here
+            # was silently dropping the closest-range observations (PnP
+            # fails most often right before crossing a gate, exactly when
+            # a centroid correction matters most).
+            vision_gates = []
+            pos_body = self.data.get('vision_gate_position_body')
+            if pos_body is not None:
+                gate_ned = state.position_ned() + state.body_to_ned_R() @ np.asarray(pos_body)
+                vision_gates.append({
+                    'position_ned': gate_ned,
+                    'confidence': self.data.get('vision_gate_confidence', 0.0),
+                })
+
+            output = guidance.compute(state=state, gates=vision_gates, obstacles=[])
 
             if output.course_complete:
                 logger.info(f"{phase_label}: complete ({guidance.status_string()}).")

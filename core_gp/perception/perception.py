@@ -217,7 +217,15 @@ class GateDetector:
         range_est = self.FX * self.gate_real_width_m / pix_width
         confidence = min(1.0, pix_width / 100.0)
 
-        position_body = None
+        # Bearing-ray fallback position -- always available from the pixel
+        # centroid alone, so callers (e.g. the MPC's gate-centroid feedback)
+        # have *something* to correct toward even when the quad/PnP solve
+        # below fails. This matters most up close, right before crossing a
+        # gate, where the contour clips against the frame edge and breaks
+        # the 4-corner fit -- exactly when a position correction is most
+        # valuable and was previously silently dropped (position_body
+        # stayed None whenever pose_valid was False).
+        position_body = ray_body * range_est
         relative_yaw = 0.0
         pose_valid = False
 
@@ -254,16 +262,34 @@ class GateDetector:
         """
         Approximates the contour to a quadrilateral and returns its 4
         corners ordered (top-left, top-right, bottom-right, bottom-left)
-        in pixel coordinates, or None if the contour isn't cleanly
-        4-sided (occlusion, blur, segmentation noise, etc.) — callers
-        fall back to the width-heuristic bearing/range estimate.
+        in pixel coordinates, or None if the contour isn't usably
+        rectangular (occlusion, blur, segmentation noise, an actually
+        round/irregular blob, etc.) — callers fall back to the
+        width-heuristic bearing/range estimate.
+
+        Falls back to the contour's minimum-area bounding box when
+        approxPolyDP doesn't land on exactly 4 points. In practice this
+        happens routinely at close range: the gate fills (or clips
+        against) the frame edge and antialiasing/segmentation noise adds
+        extra vertices, breaking the clean corner fit right when the
+        drone is closest to the gate and a position correction matters
+        most. Gated on extent (contour area vs. its bounding-box area)
+        so a genuinely round/irregular blob is still rejected instead of
+        being handed to PnP as a fake rectangle.
         """
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-        if len(approx) != 4:
-            return None
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2).astype(np.float64)
+        else:
+            rect = cv2.minAreaRect(contour)
+            (_, _), (w_px, h_px), _ = rect
+            box_area = max(w_px * h_px, 1e-6)
+            extent = cv2.contourArea(contour) / box_area
+            if extent < 0.7:
+                return None
+            pts = cv2.boxPoints(rect).astype(np.float64)
 
-        pts = approx.reshape(4, 2).astype(np.float64)
         s = pts.sum(axis=1)
         diff = pts[:, 0] - pts[:, 1]
         ordered = np.zeros((4, 2), dtype=np.float64)
