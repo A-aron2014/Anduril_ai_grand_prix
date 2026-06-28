@@ -260,7 +260,8 @@ class FlightController:
             time.sleep(0.5)
         logger.warning("Arm confirmation timed out — proceeding anyway.")
 
-    def _run_mpc_phase(self, guidance, timeout_s: float, phase_label: str) -> bool:
+    def _run_mpc_phase(self, guidance, timeout_s: float, phase_label: str,
+                        gates_sorted: list = None) -> bool:
         """
         Drives one MPCGuidance instance to completion. Each tick: read
         telemetry, ask guidance for the next position+velocity reference,
@@ -268,6 +269,12 @@ class FlightController:
         attitude/thrust loop) and send the result via _send_attitude_target.
         SET_POSITION_TARGET_LOCAL_NED is not used here -- see the note on
         SEND_TYPE_MASK above for why.
+
+        gates_sorted: the same gate list (sorted by gate_id) fly_gates() used
+        to build the course, so this can publish the *real* width/height of
+        whichever gate is currently being approached -- see the
+        active_gate_width_m/height_m note below. None during takeoff, which
+        has no real gates.
 
         Returns True if the phase's guidance reported course_complete,
         False if it timed out.
@@ -300,6 +307,29 @@ class FlightController:
                 })
 
             output = guidance.compute(state=state, gates=vision_gates, obstacles=[])
+
+            # Publish which gate the MPC is actually heading toward so
+            # _vision_shadow_compare_loop (main.py) can diff vision against
+            # the *correct* truth gate -- this was never written anywhere
+            # before, so that comparison silently stayed pinned to gate 0
+            # for the whole race regardless of actual progress.
+            leg_idx = getattr(guidance, 'leg_idx', 0)
+            self.data['active_gate'] = leg_idx
+
+            # The real per-gate width/height is already in the track data
+            # (gates_sorted[i]['width']/['height']) but GateDetector was
+            # always assuming a fixed 2.0m guess for PnP regardless -- if
+            # the real gate is bigger than that, PnP systematically
+            # concludes the gate is *closer* than it actually is (apparent
+            # size implies depth only relative to an assumed real size).
+            # setup.py's _on_frame reads these back into the detector each
+            # frame so the active gate's actual dimensions are used.
+            if gates_sorted and leg_idx < len(gates_sorted):
+                g = gates_sorted[leg_idx]
+                if g.get('width'):
+                    self.data['active_gate_width_m'] = g['width']
+                if g.get('height'):
+                    self.data['active_gate_height_m'] = g['height']
 
             if output.course_complete:
                 logger.info(f"{phase_label}: complete ({guidance.status_string()}).")
@@ -497,7 +527,8 @@ class FlightController:
             )
             guidance = MPCGuidance(course_map=course_map)
 
-            self._run_mpc_phase(guidance, timeout_per_gate_s * len(gates_sorted), "RACE")
+            self._run_mpc_phase(guidance, timeout_per_gate_s * len(gates_sorted), "RACE",
+                                 gates_sorted=gates_sorted)
             self.hold_position()
 
 

@@ -27,13 +27,23 @@ def _vision_shadow_compare_loop(shared_data, gate_store, is_running, period_s: f
             )
             warned_no_frames = True
 
-        if not shared_data.get('vision_gate_pose_valid', False):
+        # position_body is now populated for every confident detection, not
+        # just clean PnP solves (see perception.py) -- log both, tagged
+        # with pose_valid, instead of only ever seeing the high-fidelity
+        # subset (which was also previously the only thing reaching
+        # guidance, see flight_sequence.py).
+        if shared_data.get('vision_gate_position_body') is None:
             continue
 
         gates = gate_store.get_gates()
         if not gates:
             continue
 
+        # active_gate is published by FlightController._run_mpc_phase as
+        # the MPC's current leg index -- previously nothing ever wrote
+        # this, so it silently stayed at the default of 0 and every
+        # comparison below was against gate 0's truth position regardless
+        # of which gate the drone had actually progressed to.
         active_idx = shared_data.get('active_gate', 0)
         gates_sorted = sorted(gates, key=lambda g: g['gate_id'])
         truth_gate = gates_sorted[min(active_idx, len(gates_sorted) - 1)]
@@ -47,13 +57,15 @@ def _vision_shadow_compare_loop(shared_data, gate_store, is_running, period_s: f
             yaw=shared_data.get('yaw', 0.0),
         )
 
-        position_body = shared_data['vision_gate_position_body']
+        position_body = np.asarray(shared_data['vision_gate_position_body'])
         vision_gate_ned = state.position_ned() + state.body_to_ned_R() @ position_body
         truth_ned = np.array([truth_gate['north'], truth_gate['east'], truth_gate['down']])
 
         error = float(np.linalg.norm(vision_gate_ned - truth_ned))
         logging.getLogger(__name__).info(
-            f"VISION_SHADOW: vision_gate_ned=({vision_gate_ned[0]:.2f},{vision_gate_ned[1]:.2f},{vision_gate_ned[2]:.2f}) "
+            f"VISION_SHADOW: active_gate={active_idx} gate_id={truth_gate['gate_id']} "
+            f"pose_valid={shared_data.get('vision_gate_pose_valid', False)} "
+            f"vision_gate_ned=({vision_gate_ned[0]:.2f},{vision_gate_ned[1]:.2f},{vision_gate_ned[2]:.2f}) "
             f"truth_gate_ned=({truth_ned[0]:.2f},{truth_ned[1]:.2f},{truth_ned[2]:.2f}) "
             f"error_m={error:.2f} confidence={shared_data.get('vision_gate_confidence', 0.0):.2f}"
         )
@@ -95,7 +107,7 @@ def main():
             payload = payload[38:]
             gates.append({
                 "gate_id": gate_id,
-                "north": pos_n, "east": pos_e + 0.9, "down": pos_d - 1.3,
+                "north": pos_n, "east": pos_e, "down": pos_d,
                 "orient": (ow, ox, oy, oz),
                 "width": width, "height": height,
             })

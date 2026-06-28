@@ -35,6 +35,12 @@ class GateObservation:
     position_body: Optional[np.ndarray] = None   # (fwd, right, down) metres, gate center
     relative_yaw: float = 0.0                     # gate-plane heading relative to body, radians
 
+    # Median HSV sampled *inside this contour's own mask* -- unlike
+    # GateDetector.last_dominant_hsv (whole-frame, mostly background), this
+    # is what the detected blob itself actually looks like, which is the
+    # right signal to calibrate hsv_lower/hsv_upper against.
+    contour_hsv: Optional[Tuple[float, float, float]] = None
+
 
 @dataclass
 class Obstacle:
@@ -102,6 +108,7 @@ class GateDetector:
         self.last_raw_contour_count = 0
         self.last_area_filtered_count = 0
         self.last_quad_count = 0
+        self.last_pnp_fail_count = 0
         self.last_dominant_hsv: Optional[Tuple[float, float, float]] = None
 
         # Camera (OpenCV: x=right, y=down, z=forward) -> body-FRD
@@ -130,11 +137,16 @@ class GateDetector:
             logger.error("OpenCV not available")
             return []
 
-        self._update_dominant_hsv_diagnostic(frame, cv2)
+        # Computed once and threaded through -- previously this got
+        # recomputed independently inside both helper methods below.
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        contours = self._segment_and_find_contours(frame, cv2)
+        self._update_dominant_hsv_diagnostic(hsv)
+
+        contours = self._segment_and_find_contours(hsv, cv2)
         self.last_raw_contour_count = len(contours)
         self.last_quad_count = 0
+        self.last_pnp_fail_count = 0
 
         gates = []
         area_filtered = 0
@@ -143,7 +155,7 @@ class GateDetector:
             if area < self.min_contour_area:
                 continue
             area_filtered += 1
-            obs = self._contour_to_observation(cnt, cv2)
+            obs = self._contour_to_observation(cnt, cv2, hsv)
             if obs:
                 gates.append(obs)
         self.last_area_filtered_count = area_filtered
@@ -152,16 +164,16 @@ class GateDetector:
         gates.sort(key=lambda g: g.range_estimate)
         return gates
 
-    def _update_dominant_hsv_diagnostic(self, frame, cv2):
+    def _update_dominant_hsv_diagnostic(self, hsv):
         """
         Reports the dominant colour of non-gray pixels in the frame,
         independent of the configured hsv_lower/hsv_upper band -- this is
-        what should be used to actually tune that band, instead of
-        guessing. Gray/background pixels (low saturation) are excluded so
-        the result reflects whatever *is* colourful in frame (gate markers,
-        if visible).
+        NOT the detected gate's colour (see GateObservation.contour_hsv for
+        that); it's whatever is most colourful in the whole frame, which in
+        practice is usually background scenery, not the gate. Useful for a
+        coarse "is there anything colourful in view at all" sanity check,
+        not for tuning hsv_lower/hsv_upper -- use contour_hsv for that.
         """
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         sat = hsv[:, :, 1]
         colourful = sat > 60
         if not np.any(colourful):
@@ -172,15 +184,12 @@ class GateDetector:
         v = float(np.median(hsv[:, :, 2][colourful]))
         self.last_dominant_hsv = (h, s, v)
 
-    def _segment_and_find_contours(self, frame, cv2):
+    def _segment_and_find_contours(self, hsv, cv2):
         """
         HSV segmentation for brightly coloured gate markers.
-        Tune hsv_lower/hsv_upper for the actual gate colours in the sim --
-        last_dominant_hsv (set by detect()) reports the actual colourful
-        pixels in frame to calibrate against.
+        Tune hsv_lower/hsv_upper against GateObservation.contour_hsv (the
+        detected blob's own colour), not last_dominant_hsv (whole-frame).
         """
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
         mask = cv2.inRange(hsv, self.hsv_lower, self.hsv_upper)
         self.last_mask_pixel_count = int(np.count_nonzero(mask))
 
@@ -192,7 +201,7 @@ class GateDetector:
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         return contours
 
-    def _contour_to_observation(self, contour, cv2) -> Optional[GateObservation]:
+    def _contour_to_observation(self, contour, cv2, hsv) -> Optional[GateObservation]:
         rect = cv2.minAreaRect(contour)
         (cx_px, cy_px), (w_px, h_px), _ = rect
         pix_width = max(w_px, h_px)
@@ -238,6 +247,16 @@ class GateDetector:
                 range_est = float(np.linalg.norm(position_body))
                 pose_valid = True
                 confidence = min(1.0, confidence + 0.3)   # PnP solve is a stronger signal than width alone
+            else:
+                self.last_pnp_fail_count += 1
+
+        # Sampled only within this contour's own mask -- the right signal
+        # for tuning hsv_lower/hsv_upper, unlike last_dominant_hsv which is
+        # whole-frame and usually reports background scenery instead.
+        contour_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+        px = hsv[contour_mask == 255]
+        contour_hsv = tuple(float(x) for x in np.median(px, axis=0)) if px.size else None
 
         obs = GateObservation(
             pixel_center=(cx_px, cy_px),
@@ -249,6 +268,7 @@ class GateDetector:
             pose_valid=pose_valid,
             position_body=position_body,
             relative_yaw=relative_yaw,
+            contour_hsv=contour_hsv,
         )
         self._next_id += 1
         return obs
@@ -268,14 +288,17 @@ class GateDetector:
         width-heuristic bearing/range estimate.
 
         Falls back to the contour's minimum-area bounding box when
-        approxPolyDP doesn't land on exactly 4 points. In practice this
-        happens routinely at close range: the gate fills (or clips
-        against) the frame edge and antialiasing/segmentation noise adds
-        extra vertices, breaking the clean corner fit right when the
-        drone is closest to the gate and a position correction matters
-        most. Gated on extent (contour area vs. its bounding-box area)
-        so a genuinely round/irregular blob is still rejected instead of
-        being handed to PnP as a fake rectangle.
+        approxPolyDP doesn't land on exactly 4 points. This happens at
+        close range (the gate clips the frame edge, antialiasing adds
+        vertices) but turns out to be just as common at long range
+        (confirmed via the contour_hsv/quads/pnp_fail diagnostics in real
+        runs): a small, few-pixel-wide gate blob has a ragged, noisy edge
+        relative to its tiny bounding box, which also breaks the clean
+        4-point fit. Gated on extent (contour area vs. its bounding-box
+        area, 0.6 threshold -- loosened from 0.7 after confirming on real
+        runs that the long-range case needed the looser bound to ever
+        engage PnP at all) so a genuinely thin/irregular noise contour is
+        still rejected instead of being handed to PnP as a fake rectangle.
         """
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
@@ -286,7 +309,7 @@ class GateDetector:
             (_, _), (w_px, h_px), _ = rect
             box_area = max(w_px * h_px, 1e-6)
             extent = cv2.contourArea(contour) / box_area
-            if extent < 0.7:
+            if extent < 0.6:
                 return None
             pts = cv2.boxPoints(rect).astype(np.float64)
 

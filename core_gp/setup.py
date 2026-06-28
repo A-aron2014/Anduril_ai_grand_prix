@@ -50,6 +50,19 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port, vi
     detector = perception.gate_detector
 
     def _on_frame(frame, sim_time_ns):
+        # FlightController publishes the *actual* width/height of whichever
+        # gate is currently being approached (flight_sequence.py) -- PnP's
+        # depth estimate depends on assuming a real-world size, and the
+        # detector's constructor default (2.0m) was systematically wrong
+        # whenever a gate's real size differed, undershooting true range by
+        # however far off that guess was. Use the real value once known.
+        gate_w = shared_data.get('active_gate_width_m')
+        gate_h = shared_data.get('active_gate_height_m')
+        if gate_w:
+            detector.gate_real_width_m = float(gate_w)
+        if gate_h:
+            detector.gate_real_height_m = float(gate_h)
+
         body_velocity = np.array([
             shared_data.get('vel_x', 0.0),
             shared_data.get('vel_y', 0.0),
@@ -98,19 +111,38 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port, vi
                     f"mask_px={detector.last_mask_pixel_count} "
                     f"raw_contours={detector.last_raw_contour_count} "
                     f"area_filtered={detector.last_area_filtered_count} "
-                    f"quads={detector.last_quad_count} "
+                    f"quads={detector.last_quad_count} pnp_fail={detector.last_pnp_fail_count} "
                     f"dominant_colourful_hsv={hsv_str} "
                     f"(configured band: {detector.hsv_lower.tolist()}-{detector.hsv_upper.tolist()})"
                 )
             else:
                 best = perception.latest_gates[0]
+                gate_hsv = best.contour_hsv
+                gate_hsv_str = f"({gate_hsv[0]:.0f},{gate_hsv[1]:.0f},{gate_hsv[2]:.0f})" if gate_hsv else "none"
+                pos_str = (
+                    f"({best.position_body[0]:.1f},{best.position_body[1]:.1f},{best.position_body[2]:.1f})"
+                    if best.position_body is not None else "none"
+                )
                 logger.info(
                     f"VISION: frame_count={diag['frame_count']} "
                     f"gates_in_frame={len(perception.latest_gates)} "
                     f"best_confidence={best.confidence:.2f} "
-                    f"pose_valid={best.pose_valid} "
-                    f"range_est={best.range_estimate:.1f}m "
-                    f"dominant_colourful_hsv={hsv_str}"
+                    f"pose_valid={best.pose_valid} quads={detector.last_quad_count} "
+                    f"pnp_fail={detector.last_pnp_fail_count} "
+                    f"range_est={best.range_estimate:.1f}m pos_body={pos_str} "
+                    # gate_hsv is this detection's own colour (the right
+                    # thing to tune hsv_lower/hsv_upper against);
+                    # dominant_colourful_hsv is whole-frame and usually
+                    # just reports background scenery -- kept for an
+                    # at-a-glance contrast between the two.
+                    f"gate_hsv={gate_hsv_str} dominant_colourful_hsv={hsv_str} "
+                    f"active_gate={shared_data.get('active_gate', '?')} "
+                    # assumed_size is whatever GateDetector is currently
+                    # using for the PnP/range solve -- confirms directly
+                    # whether the active-gate width/height from track data
+                    # actually made it into the detector this frame, rather
+                    # than inferring it indirectly from range_est.
+                    f"assumed_size=({detector.gate_real_width_m:.2f}x{detector.gate_real_height_m:.2f}m)"
                 )
 
     vision_rx = VisionStreamReceiver(port=vision_port, on_frame_callback=_on_frame)

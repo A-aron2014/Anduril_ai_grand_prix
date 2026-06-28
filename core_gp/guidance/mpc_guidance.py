@@ -112,18 +112,25 @@ class MPCConfig:
     obstacle_gain: float = 6.0
 
     # Camera gate-centroid feedback: nudges the reference trajectory toward
-    # the vision-derived (PnP) gate position instead of trusting the sim's
-    # gate telemetry blindly for the whole horizon. gate_vision_gain is a
-    # blend factor, not a full override -- 1.0 would replace the path's own
-    # waypoint with the vision estimate outright, which we don't want given
-    # vision is noisier frame-to-frame than the ground-truth course geometry.
-    # gate_vision_match_radius rejects observations that aren't plausibly
-    # *this* leg's gate (e.g. a different gate visible in frame, or a bad
-    # PnP solve) by requiring the detection be within this distance of the
-    # waypoint we're already heading toward.
+    # the vision-derived (PnP, or width/bearing fallback) gate position
+    # instead of trusting the sim's gate telemetry blindly for the whole
+    # horizon. gate_vision_gain is a blend factor, not a full override --
+    # 1.0 would replace the path's own waypoint with the vision estimate
+    # outright, which we don't want given vision is noisier frame-to-frame
+    # than the ground-truth course geometry.
+    #
+    # match_radius/min_confidence were 4.0/0.4 -- on real runs (after
+    # fixing GateDetector to use each gate's actual width/height from track
+    # data instead of a hardcoded 2.0m guess, which had been the dominant
+    # error source) the *residual* vision error still routinely sits in the
+    # 5-9m band and confidence routinely lands at 0.39-0.40, just on the
+    # wrong side of the old thresholds -- rejecting essentially all of it.
+    # Loosened both so genuine, now-much-smaller-bias signal gets a chance
+    # to actually apply instead of being thrown out by thresholds tuned
+    # against the old, bigger systematic error.
     gate_vision_gain: float = 0.5
-    gate_vision_match_radius: float = 4.0
-    gate_vision_min_confidence: float = 0.4
+    gate_vision_match_radius: float = 6.0
+    gate_vision_min_confidence: float = 0.35
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +318,20 @@ class MPCGuidance:
         self._last_horiz_clipped = False
         self._last_vert_clipped = False
 
+        # leg_idx is read from outside (flight_sequence.py publishes it to
+        # shared_data as 'active_gate' so the vision shadow-compare loop in
+        # main.py can diff against the *correct* truth gate instead of
+        # always gate 0 -- it was never updated before, so that comparison
+        # was meaningless past the first leg).
+        self.leg_idx: int = 0
+
+        # Gate-vision-bias diagnostics -- otherwise there's no way to tell
+        # from the logs whether a vision observation is actually correcting
+        # the reference path or being silently rejected (and why).
+        self._last_gate_vision_applied = False
+        self._last_gate_vision_reject_reason = "no_obs"
+        self._last_gate_vision_err_mag = 0.0
+
     # ------------------------------------------------------------------
 
     def _build_path(self, start_ned):
@@ -383,11 +404,22 @@ class MPCGuidance:
             f"{'(H-CLIP)' if self._last_horiz_clipped else ''}"
             f"{'(V-CLIP)' if self._last_vert_clipped else ''}"
         )
+        # Whether the camera's gate-centroid observation actually corrected
+        # the reference this tick, or was rejected and why (no detection,
+        # too low confidence, or too far from the waypoint we're already
+        # heading toward to plausibly be the same gate) -- without this
+        # there's no way to tell from the logs whether vision feedback is
+        # doing anything at all.
+        if self._last_gate_vision_applied:
+            vision_str = f" GATE_VISION=applied(err={self._last_gate_vision_err_mag:.1f}m)"
+        else:
+            vision_str = f" GATE_VISION=rejected:{self._last_gate_vision_reject_reason}"
+
         return (
             f"leg={idx + 1}/{n_legs} dist_to_next_wp={dist_to_next_wp:.1f}m "
             f"next_wp=({next_wp[0]:.1f},{next_wp[1]:.1f},{next_wp[2]:.1f}) "
             f"course_progress={self.progress_s:.1f}/{self.path.total_len:.1f}m"
-            f"{ref_str}{dev_str}{accel_str}"
+            f"{ref_str}{dev_str}{accel_str}{vision_str}"
         )
 
     def _reference_horizon(self) -> np.ndarray:
@@ -432,22 +464,35 @@ class MPCGuidance:
         bend toward the corrected estimate, not just the next instant.
         """
         if not gates:
+            self._last_gate_vision_applied = False
+            self._last_gate_vision_reject_reason = "no_obs"
+            self._last_gate_vision_err_mag = 0.0
             return x_ref
         cfg = self.cfg
         best = max(gates, key=lambda g: g.get('confidence', 0.0))
-        if best.get('confidence', 0.0) < cfg.gate_vision_min_confidence:
+        best_conf = best.get('confidence', 0.0)
+        if best_conf < cfg.gate_vision_min_confidence:
+            self._last_gate_vision_applied = False
+            self._last_gate_vision_reject_reason = f"low_confidence({best_conf:.2f})"
+            self._last_gate_vision_err_mag = 0.0
             return x_ref
 
         target_wp = self.path.points[min(leg_idx + 1, len(self.path.points) - 1)]
         obs_pos = np.asarray(best['position_ned'], dtype=float)
         err = obs_pos - target_wp
-        if np.linalg.norm(err) > cfg.gate_vision_match_radius:
+        err_mag = float(np.linalg.norm(err))
+        self._last_gate_vision_err_mag = err_mag
+        if err_mag > cfg.gate_vision_match_radius:
             # Not plausibly the gate we're already heading toward (a
             # different gate in frame, or a noisy/bad PnP solve) -- ignore
             # rather than yank the path toward an unrelated point.
+            self._last_gate_vision_applied = False
+            self._last_gate_vision_reject_reason = f"too_far({err_mag:.1f}m>{cfg.gate_vision_match_radius:.1f}m)"
             return x_ref
 
         x_ref[:, 0:3] += err[None, :] * cfg.gate_vision_gain
+        self._last_gate_vision_applied = True
+        self._last_gate_vision_reject_reason = None
         return x_ref
 
     # ------------------------------------------------------------------
@@ -473,6 +518,7 @@ class MPCGuidance:
             np.searchsorted(self.path.cum_len, self.progress_s, side='right') - 1,
             0, len(self.path.seg_dir) - 1,
         ))
+        self.leg_idx = leg_idx
         if leg_idx > self._last_leg_idx:
             wp = self.path.points[leg_idx]
             logger.info(
