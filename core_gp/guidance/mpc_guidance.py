@@ -119,18 +119,29 @@ class MPCConfig:
     # outright, which we don't want given vision is noisier frame-to-frame
     # than the ground-truth course geometry.
     #
-    # match_radius/min_confidence were 4.0/0.4 -- on real runs (after
-    # fixing GateDetector to use each gate's actual width/height from track
-    # data instead of a hardcoded 2.0m guess, which had been the dominant
-    # error source) the *residual* vision error still routinely sits in the
-    # 5-9m band and confidence routinely lands at 0.39-0.40, just on the
-    # wrong side of the old thresholds -- rejecting essentially all of it.
-    # Loosened both so genuine, now-much-smaller-bias signal gets a chance
-    # to actually apply instead of being thrown out by thresholds tuned
-    # against the old, bigger systematic error.
+    # gate_vision_max_range is the important one: it used to be capped at
+    # 10m because a pose_valid=True, confidence=0.97 detection still had
+    # 8.76m of NED error at 15-23m range (corner-labelling bias in the PnP
+    # solve, see GateDetector._contour_to_quad/_solve_pnp). That bias is
+    # now fixed (perception.py uses the corner-order-independent pixel
+    # centroid for direction, PnP only for depth) -- confirmed on real
+    # runs the remaining error at 17-23m is down to 2.6-3.5m, not 8m+.
+    # Raised so vision gets a longer runway to correct the lateral drift
+    # (see AttitudeAutopilot) before the gate arrives -- the prior 10m cap
+    # meant correction only had ~1.5s/12m to act, consistently too late to
+    # cancel drift that had been building for the whole ~20m leg.
     gate_vision_gain: float = 0.5
-    gate_vision_match_radius: float = 6.0
+    gate_vision_match_radius: float = 4.0
     gate_vision_min_confidence: float = 0.35
+    gate_vision_max_range: float = 18.0
+
+    # Blend weight for folding each new *accepted* sighting into the
+    # persistent per-leg gate-position estimate (see
+    # MPCGuidance._gate_vision_estimate) -- 1.0 would just snap to
+    # whatever the latest single sighting says (no smoothing benefit
+    # across multiple looks as range closes); low values converge slowly
+    # but reject single-frame noise spikes better.
+    gate_vision_smoothing: float = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +343,16 @@ class MPCGuidance:
         self._last_gate_vision_reject_reason = "no_obs"
         self._last_gate_vision_err_mag = 0.0
 
+        # Persistent, smoothed estimate of the *current leg's* gate
+        # position once a vision sighting has passed the safety checks --
+        # without this, a correction established on one good tick was
+        # being discarded on the very next tick whenever that tick's fresh
+        # sample (alone, on its own) didn't independently re-pass every
+        # check, even though nothing about the gate moved. Reset whenever
+        # leg_idx changes (a new gate -- the old estimate doesn't apply).
+        self._gate_vision_estimate: np.ndarray = None
+        self._gate_vision_estimate_leg: int = None
+
     # ------------------------------------------------------------------
 
     def _build_path(self, start_ned):
@@ -456,43 +477,103 @@ class MPCGuidance:
 
     def _gate_vision_bias(self, x_ref: np.ndarray, leg_idx: int, gates) -> np.ndarray:
         """
-        gates: list of {'position_ned': np.ndarray, 'confidence': float}
-        observations (already transformed from the camera's body-frame PnP
-        pose into NED by the caller). Unlike _obstacle_bias, this doesn't
-        decay across the horizon -- the gate is a fixed point, not a threat
-        only known "right now", so the whole reference trajectory should
-        bend toward the corrected estimate, not just the next instant.
+        gates: list of {'position_ned': np.ndarray, 'confidence': float,
+        'range': float} observations (already transformed from the
+        camera's body-frame PnP pose into NED by the caller). Unlike
+        _obstacle_bias, this doesn't decay across the horizon -- the gate
+        is a fixed point, not a threat only known "right now", so the
+        whole reference trajectory should bend toward the corrected
+        estimate, not just the next instant.
+
+        Maintains self._gate_vision_estimate, a persistent per-leg
+        estimate of the gate's true NED position, rather than computing a
+        one-shot bias from whatever's in `gates` *this tick* and
+        discarding it right after. Without persistence, a correction
+        that had just been established from a good sighting was vanishing
+        the very next tick whenever that tick's fresh sample alone didn't
+        independently re-pass every check (e.g. a frame that arrived
+        between camera updates, or one noisier sample) -- even though
+        nothing about the gate's actual position changed. New sightings
+        only ever get *blended* into the running estimate (smoothing,
+        not snap-replace) so a few consistent looks converge, and only
+        after passing the safety checks against the original ground-truth
+        waypoint specifically -- not the running estimate itself -- so one
+        bad sighting can't validate a drifting chain of subsequent ones.
         """
-        if not gates:
-            self._last_gate_vision_applied = False
-            self._last_gate_vision_reject_reason = "no_obs"
-            self._last_gate_vision_err_mag = 0.0
-            return x_ref
         cfg = self.cfg
-        best = max(gates, key=lambda g: g.get('confidence', 0.0))
-        best_conf = best.get('confidence', 0.0)
-        if best_conf < cfg.gate_vision_min_confidence:
-            self._last_gate_vision_applied = False
-            self._last_gate_vision_reject_reason = f"low_confidence({best_conf:.2f})"
-            self._last_gate_vision_err_mag = 0.0
-            return x_ref
+
+        if leg_idx != self._gate_vision_estimate_leg:
+            # New leg -- any persisted estimate belonged to the gate we
+            # just passed, not this one.
+            self._gate_vision_estimate = None
+            self._gate_vision_estimate_leg = leg_idx
 
         target_wp = self.path.points[min(leg_idx + 1, len(self.path.points) - 1)]
-        obs_pos = np.asarray(best['position_ned'], dtype=float)
-        err = obs_pos - target_wp
-        err_mag = float(np.linalg.norm(err))
-        self._last_gate_vision_err_mag = err_mag
-        if err_mag > cfg.gate_vision_match_radius:
-            # Not plausibly the gate we're already heading toward (a
-            # different gate in frame, or a noisy/bad PnP solve) -- ignore
-            # rather than yank the path toward an unrelated point.
+        fresh_reject_reason = "no_obs"
+
+        if gates:
+            best = max(gates, key=lambda g: g.get('confidence', 0.0))
+            best_conf = best.get('confidence', 0.0)
+            obs_pos = best.get('position_ned')
+            if obs_pos is None or best_conf < cfg.gate_vision_min_confidence:
+                fresh_reject_reason = f"low_confidence({best_conf:.2f})"
+            else:
+                # Monocular PnP at long range is dominated by random
+                # pixel-corner noise, not bias -- confirmed on a real run
+                # where a confidence=0.97 PnP-valid detection still had
+                # ~9m of NED error at ~20m range. Trusting that as a
+                # correction was measurably worse than ignoring it
+                # (LATERAL_DEV grew while "applied" was active, shrank
+                # once rejected again).
+                best_range = best.get('range', float('inf'))
+                if best_range > cfg.gate_vision_max_range:
+                    fresh_reject_reason = f"out_of_range({best_range:.1f}m>{cfg.gate_vision_max_range:.1f}m)"
+                else:
+                    obs_pos = np.asarray(obs_pos, dtype=float)
+                    err_mag = float(np.linalg.norm(obs_pos - target_wp))
+                    if err_mag > cfg.gate_vision_match_radius:
+                        # Not plausibly the gate we're already heading
+                        # toward (a different gate in frame, or a bad PnP
+                        # solve) -- ignore rather than risk corrupting the
+                        # running estimate with an unrelated point.
+                        fresh_reject_reason = f"too_far({err_mag:.1f}m>{cfg.gate_vision_match_radius:.1f}m)"
+                    else:
+                        if self._gate_vision_estimate is None:
+                            self._gate_vision_estimate = obs_pos
+                        else:
+                            a = cfg.gate_vision_smoothing
+                            self._gate_vision_estimate = (1 - a) * self._gate_vision_estimate + a * obs_pos
+                        fresh_reject_reason = None
+
+        if self._gate_vision_estimate is None:
+            # Never established a correction for this leg yet -- nothing
+            # to apply.
             self._last_gate_vision_applied = False
-            self._last_gate_vision_reject_reason = f"too_far({err_mag:.1f}m>{cfg.gate_vision_match_radius:.1f}m)"
+            self._last_gate_vision_reject_reason = fresh_reject_reason
+            self._last_gate_vision_err_mag = 0.0
             return x_ref
 
-        x_ref[:, 0:3] += err[None, :] * cfg.gate_vision_gain
+        err = self._gate_vision_estimate - target_wp
+        self._last_gate_vision_err_mag = float(np.linalg.norm(err))
         self._last_gate_vision_applied = True
-        self._last_gate_vision_reject_reason = None
+        # None = this tick's sighting freshly updated the estimate;
+        # otherwise we're holding a previously-established correction
+        # through a tick whose own sighting didn't pass (and why).
+        self._last_gate_vision_reject_reason = (
+            f"holding,fresh={fresh_reject_reason}" if fresh_reject_reason else None
+        )
+        # North/east only -- confirmed on real runs that vision's vertical
+        # (down) estimate carries a large, systematic bias (still 3.6m off
+        # at ~2m range, not shrinking the way corner-noise would) almost
+        # certainly from the gate's lower edge getting clipped by the
+        # ground/horizon in a low-altitude, upward-tilted-camera frame,
+        # biasing the detected blob's centroid upward. Blending that into
+        # x_ref's vertical channel was overshooting *past* the
+        # already-corrected static gate-center altitude (see fly_gates'
+        # height/2 offset) toward vision's inflated estimate, clipping the
+        # *top* of the gate instead of the bottom. Lateral/forward accuracy
+        # don't show this problem -- only down is excluded.
+        x_ref[:, 0:2] += err[None, 0:2] * cfg.gate_vision_gain
         return x_ref
 
     # ------------------------------------------------------------------
@@ -513,6 +594,23 @@ class MPCGuidance:
         # the polyline (can happen near sharp turns where two segments pass
         # close to each other) -- only allow tiny jitter, not a real regression.
         self.progress_s = max(raw_s, self.progress_s - 0.25)
+
+        # NOTE: a gate-capture clamp was tried here (hold progress_s at the
+        # current gate's arc length until within pass_distance of it, to
+        # stop project()'s whole-polyline nearest-segment search from
+        # jumping progress onto the next leg early). Reverted -- confirmed
+        # on a real run that the vehicle was already ~7m off the line
+        # (LATERAL_DEV) by the time it reached gate 0's arc length, for
+        # reasons unrelated to corner-cutting (see the lateral-drift note
+        # in AttitudeAutopilot/flight log analysis), so the clamp never
+        # released: progress_s froze permanently at the unreached gate
+        # while the vehicle kept flying past it on momentum, and the LQ
+        # tracker fought to return to an increasingly stale target against
+        # that momentum (U0_RAW up to 78 m/s2, roll/pitch pinned near
+        # saturation, speed climbing past 12 m/s with no sign of settling).
+        # An unconditional hard capture radius isn't safe without an
+        # escape valve for "already missed it, move on" -- worse than the
+        # corner-cutting it was meant to fix.
 
         leg_idx = int(np.clip(
             np.searchsorted(self.path.cum_len, self.progress_s, side='right') - 1,
@@ -591,13 +689,32 @@ class MPCGuidance:
         # a *huge* velocity feedforward with a position that's only an
         # infinitesimal step from "where you already are" is an internally
         # inconsistent reference for a position-tracking controller. Use a
-        # real lead point a few ticks into the MPC's own predicted
-        # trajectory instead -- "where the plan says to be shortly",
-        # consistent with the commanded velocity, the way a pure-pursuit
-        # lookahead point is.
+        # real lead point a few ticks ahead instead -- "where the plan says
+        # to be shortly".
+        #
+        # Previously sourced from the MPC's own predicted trajectory
+        # (x_pred = mpc.predict(x0, U)), i.e. forward-simulating the
+        # *vehicle's actual state* x0 under the chosen (and often clipped)
+        # control. Confirmed on a real run (2026-06-27) this silently
+        # defeats AttitudeAutopilot's position-error feedback whenever the
+        # raw LQ solve gets clipped (max_accel_horiz=10.5, saturated nearly
+        # every tick of the leg): TARGET_POS's east tracked POS's east
+        # almost 1:1 (3.6 vs 3.8m at one sample) while the real path
+        # (on_line_now) sat near 0.3m -- LATERAL_DEV climbed past 4m by the
+        # gate and kept growing into the next leg, because
+        # target_position-position (what AttitudeAutopilot actually
+        # corrects against) stayed under 0.2m the whole time despite the
+        # true cross-track error being 20x that. x_pred, propagated from
+        # an already-off-path x0 under a control authority that's
+        # bottlenecked by clipping, just parallels the vehicle's existing
+        # drift instead of converging back to the path within the lookahead
+        # window. x_ref has no such dependency -- it's sampled purely from
+        # the path's own arc-length parameterization (_reference_horizon),
+        # so using it here makes target_position-position a direct,
+        # uncorrupted measure of the real cross-track error, restoring the
+        # position loop's ability to react to it.
         lookahead_idx = min(cfg.position_lookahead_steps, cfg.horizon) - 1
-        x_pred = self.mpc.predict(x0, U)
-        target_position = x_pred[lookahead_idx, 0:3]
+        target_position = x_ref[lookahead_idx, 0:3]
 
         # Heading from the path's own tangent direction at the current
         # progress point (x_ref[0, 3:6], already computed above as

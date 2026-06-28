@@ -243,8 +243,28 @@ class GateDetector:
             self.last_quad_count += 1
             pnp_result = self._solve_pnp(quad, cv2)
             if pnp_result is not None:
-                position_body, relative_yaw = pnp_result
-                range_est = float(np.linalg.norm(position_body))
+                pnp_position_body, relative_yaw = pnp_result
+                # Use PnP for RANGE only, not direction. _contour_to_quad's
+                # corner labelling (sum/diff "top-left has smallest x+y"
+                # trick) assumes a roughly axis-aligned quad in image
+                # space; under an oblique view -- which is the normal case
+                # here given the camera's fixed 20deg up-tilt stacked with
+                # vehicle pitch and an angled approach -- that labelling can
+                # consistently assign the wrong image corner to the wrong
+                # model corner. Because the viewing geometry on any given
+                # gate is the same every run, a labelling error there isn't
+                # random noise, it's a *repeatable* directional bias in
+                # solvePnP's translation vector (observed: consistently
+                # targeting one specific corner of the gate, not its
+                # center). The pixel-centroid bearing ray (ray_body, from
+                # minAreaRect, already computed above) has no corner
+                # correspondence to get wrong and always points at the
+                # actual visual center -- depth from PnP is comparatively
+                # trustworthy since it's driven mainly by overall apparent
+                # size, not which corner is labelled what.
+                pnp_range = float(np.linalg.norm(pnp_position_body))
+                position_body = ray_body * pnp_range
+                range_est = pnp_range
                 pose_valid = True
                 confidence = min(1.0, confidence + 0.3)   # PnP solve is a stronger signal than width alone
             else:

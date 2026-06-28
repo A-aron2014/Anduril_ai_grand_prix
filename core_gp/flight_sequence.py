@@ -10,6 +10,7 @@ Basic flight workflow for the Anduril AI Grand Prix sim:
 """
 
 import math
+import os
 import struct
 import time
 import threading
@@ -20,8 +21,21 @@ import numpy as np
 from core.state_estimator import VehicleState
 from control.attitude_autopilot import AttitudeAutopilot
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s %(levelname)s %(message)s')
+
+# Mirrors every log line to race.log next to this file (overwritten each
+# run) in addition to the console -- so a full run's telemetry (including
+# whatever scrolled past the terminal/got cut off pasting it elsewhere) is
+# always available to read back afterward without having to redirect
+# stdout manually.
+_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "race.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_LOG_FILE, mode='w'),
+    ],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +318,7 @@ class FlightController:
                 vision_gates.append({
                     'position_ned': gate_ned,
                     'confidence': self.data.get('vision_gate_confidence', 0.0),
+                    'range': self.data.get('vision_gate_range', float('inf')),
                 })
 
             output = guidance.compute(state=state, gates=vision_gates, obstacles=[])
@@ -517,12 +532,26 @@ class FlightController:
                 return
 
             # CourseMap wants (north, east, down) tuples + a cruise speed.
-            # 'down' here is already the sim-corrected altitude value used
-            # by the rest of fly_gates (-pos_d + 1.5), so guidance and
-            # actuation share one consistent definition of gate altitude.
+            #
+            # g['down'] is NOT the opening's vertical center -- confirmed
+            # across multiple real runs (vehicle tracking g['down'] almost
+            # exactly, by every other measure on-line, still consistently
+            # clips the *bottom* of the gate frame / passes *under* it).
+            # That's the signature of the track data anchoring each gate's
+            # reported position at the base of its frame (a common 3D-asset
+            # convention: model origin placed where it meets the ground),
+            # not at the center of the hole you actually fly through.
+            # Correct by climbing half the gate's height above the reported
+            # point. This is a flat per-gate offset, correct as long as the
+            # gate is level (no roll/pitch in its own orientation) -- true
+            # for this course's gates by inspection, but NOT general: a
+            # gate banked/tilted in 3D would need this offset rotated by
+            # its orientation quaternion (g['orient'], already parsed in
+            # main.py's track-data callback but unused everywhere) before
+            # adding it in NED. Revisit if a future course has tilted gates.
             course_map = CourseMap()
             course_map.load_from_list(
-                [(g['north'], g['east'], g['down']) for g in gates_sorted],
+                [(g['north'], g['east'], g['down'] - g['height'] / 2.0) for g in gates_sorted],
                 speed=8.0,   # cruise speed_mps fed into the speed scheduler
             )
             guidance = MPCGuidance(course_map=course_map)
